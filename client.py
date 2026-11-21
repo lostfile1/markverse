@@ -29,9 +29,7 @@ from mv3d import (
     _quat_rotate_vec,
     build_template_mv3d_world,
     compute_md_sha256,
-    is_safe_media_url,
     normalize_expression_name,
-    normalize_media_embed_url,
     parse_color,
     parse_mv3d,
     validate_mv3d_document,
@@ -106,20 +104,17 @@ VERT_3D = """
 #version 330 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
-layout(location = 2) in vec2 aUV;
 
 uniform mat4 uMVP;
 uniform mat4 uModel;
 
 out vec3 vNormal;
 out vec3 vFragPos;
-out vec2 vUV;
 
 void main() {
     vec4 worldPos = uModel * vec4(aPos, 1.0);
     vFragPos = worldPos.xyz;
     vNormal = mat3(transpose(inverse(uModel))) * aNormal;
-    vUV = aUV;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }
 """
@@ -128,7 +123,6 @@ FRAG_3D = """
 #version 330 core
 in vec3 vNormal;
 in vec3 vFragPos;
-in vec2 vUV;
 
 uniform vec3 uColor;
 uniform vec3 uEmissive;
@@ -137,20 +131,10 @@ uniform vec3 uLightDir;
 uniform vec3 uCamPos;
 uniform vec3 uFogColor;
 uniform float uFogDensity;
-uniform sampler2D uTex;
-uniform int uUseTex;
 
 out vec4 FragColor;
 
 void main() {
-    if (uUseTex == 1) {
-        vec4 texel = texture(uTex, vUV);
-        float dist = length(uCamPos - vFragPos);
-        float fogFactor = clamp(exp(-pow(dist * uFogDensity, 2.0)), 0.0, 1.0);
-        vec3 finalRgb = mix(uFogColor, texel.rgb, fogFactor);
-        FragColor = vec4(finalRgb, texel.a * uAlpha);
-        return;
-    }
     vec3 norm = normalize(vNormal);
     float diff = max(dot(norm, normalize(uLightDir)), 0.0);
     vec3 ambient = 0.42 * uColor;
@@ -342,47 +326,19 @@ def _build_wire_box_verts() -> np.ndarray:
     return np.array(data, dtype=np.float32)
 
 
-def _build_unit_screen_quad_verts() -> np.ndarray:
-    # Front (+Z) and Back (-Z) textured screen faces with stride 8 (pos3, norm3, uv2)
-    pts = [
-        # Front (+Z)
-        (-0.5, -0.5, 0.52, 0.0, 0.0, 1.0, 0.0, 0.0),
-        (0.5, -0.5, 0.52, 0.0, 0.0, 1.0, 1.0, 0.0),
-        (0.5, 0.5, 0.52, 0.0, 0.0, 1.0, 1.0, 1.0),
-        (-0.5, -0.5, 0.52, 0.0, 0.0, 1.0, 0.0, 0.0),
-        (0.5, 0.5, 0.52, 0.0, 0.0, 1.0, 1.0, 1.0),
-        (-0.5, 0.5, 0.52, 0.0, 0.0, 1.0, 0.0, 1.0),
-        # Back (-Z)
-        (0.5, -0.5, -0.52, 0.0, 0.0, -1.0, 0.0, 0.0),
-        (-0.5, -0.5, -0.52, 0.0, 0.0, -1.0, 1.0, 0.0),
-        (-0.5, 0.5, -0.52, 0.0, 0.0, -1.0, 1.0, 1.0),
-        (0.5, -0.5, -0.52, 0.0, 0.0, -1.0, 0.0, 0.0),
-        (-0.5, 0.5, -0.52, 0.0, 0.0, -1.0, 1.0, 1.0),
-        (0.5, 0.5, -0.52, 0.0, 0.0, -1.0, 0.0, 1.0),
-    ]
-    data = []
-    for row in pts:
-        data.extend(row)
-    return np.array(data, dtype=np.float32)
-
-
 class MeshVAO:
-    def __init__(self, interleaved_verts: np.ndarray, draw_mode=GL_TRIANGLES, stride_floats: int = 6):
-        self.vert_count = len(interleaved_verts) // stride_floats
+    def __init__(self, interleaved_verts: np.ndarray, draw_mode=GL_TRIANGLES):
+        self.vert_count = len(interleaved_verts) // 6
         self.draw_mode = draw_mode
-        stride_bytes = stride_floats * 4
         self.vao = glGenVertexArrays(1)
         self.vbo = glGenBuffers(1)
         glBindVertexArray(self.vao)
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
         glBufferData(GL_ARRAY_BUFFER, interleaved_verts.nbytes, interleaved_verts, GL_STATIC_DRAW)
         glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride_bytes, ctypes.c_void_p(0))
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(0))
         glEnableVertexAttribArray(1)
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride_bytes, ctypes.c_void_p(12))
-        if stride_floats >= 8:
-            glEnableVertexAttribArray(2)
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride_bytes, ctypes.c_void_p(24))
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 24, ctypes.c_void_p(12))
         glBindVertexArray(0)
 
     def draw(self):
@@ -415,7 +371,6 @@ class ModernRenderer:
             "cone": MeshVAO(_build_unit_cylinder_verts(24, cone=True)),
             "sphere": MeshVAO(_build_unit_sphere_verts(12, 18)),
             "wirebox": MeshVAO(_build_wire_box_verts(), draw_mode=GL_LINES),
-            "screenquad": MeshVAO(_build_unit_screen_quad_verts(), stride_floats=8),
         }
         self.dynamic_vaos: dict[int, MeshVAO] = {}
 
@@ -479,7 +434,6 @@ class ModernRenderer:
         return vao
 
     def draw_object(self, obj: dict, vp_mat: np.ndarray, parent_mat: np.ndarray | None = None):
-        glUseProgram(self.prog3d)
         px, py, pz = obj["pos"]
         rx, ry, rz, ang = obj.get("rot", (0.0, 1.0, 0.0, 0.0))
         sx, sy, sz = obj.get("scale", (1.0, 1.0, 1.0))
@@ -507,28 +461,10 @@ class ModernRenderer:
 
         glUniformMatrix4fv(glGetUniformLocation(self.prog3d, "uModel"), 1, GL_TRUE, model)
         glUniformMatrix4fv(glGetUniformLocation(self.prog3d, "uMVP"), 1, GL_TRUE, mvp)
-        glUniform1i(glGetUniformLocation(self.prog3d, "uUseTex"), 0)
         glUniform3f(glGetUniformLocation(self.prog3d, "uColor"), *obj["diff"])
         glUniform3f(glGetUniformLocation(self.prog3d, "uEmissive"), *obj["emis"])
         glUniform1f(glGetUniformLocation(self.prog3d, "uAlpha"), obj.get("alpha", 1.0))
         mesh.draw()
-
-        if isinstance(obj.get("media"), dict) and getattr(self, "media_mgr", None) is not None and getattr(self, "hud_font", None) is not None:
-            tex_id = self.media_mgr.get_gl_texture(
-                obj["media"],
-                self.hud_font,
-                scroll_y=getattr(self, "active_scroll_y", 0),
-                paused=getattr(self, "active_paused", False),
-                muted=getattr(self, "active_muted", False),
-            )
-            if tex_id:
-                glActiveTexture(GL_TEXTURE0)
-                glBindTexture(GL_TEXTURE_2D, tex_id)
-                glUniform1i(glGetUniformLocation(self.prog3d, "uTex"), 0)
-                glUniform1i(glGetUniformLocation(self.prog3d, "uUseTex"), 1)
-                glUniform1f(glGetUniformLocation(self.prog3d, "uAlpha"), 1.0)
-                self.meshes["screenquad"].draw()
-                glUniform1i(glGetUniformLocation(self.prog3d, "uUseTex"), 0)
 
     def draw_wire_aabb(self, box: tuple[float, float, float, float, float, float], vp_mat: np.ndarray):
         cx = 0.5 * (box[0] + box[1])
@@ -553,28 +489,6 @@ class ModernRenderer:
         ], dtype=np.float32)
         glUniform1i(glGetUniformLocation(self.prog2d, "uUseTex"), 0)
         glUniform4f(glGetUniformLocation(self.prog2d, "uColor"), *rgba)
-        glBindVertexArray(self.quad_vao)
-        glBindBuffer(GL_ARRAY_BUFFER, self.quad_vbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
-        glDrawArrays(GL_TRIANGLES, 0, 6)
-        glBindVertexArray(0)
-
-    def draw_tex_2d(self, x: float, y: float, w: float, h: float, tex: int):
-        if not tex:
-            return
-        verts = np.array([
-            x, y, 0.0, 1.0,
-            x + w, y, 1.0, 1.0,
-            x + w, y + h, 1.0, 0.0,
-            x, y, 0.0, 1.0,
-            x + w, y + h, 1.0, 0.0,
-            x, y + h, 0.0, 0.0,
-        ], dtype=np.float32)
-        glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, tex)
-        glUniform1i(glGetUniformLocation(self.prog2d, "uTex"), 0)
-        glUniform1i(glGetUniformLocation(self.prog2d, "uUseTex"), 1)
-        glUniform4f(glGetUniformLocation(self.prog2d, "uColor"), 1.0, 1.0, 1.0, 1.0)
         glBindVertexArray(self.quad_vao)
         glBindBuffer(GL_ARRAY_BUFFER, self.quad_vbo)
         glBufferSubData(GL_ARRAY_BUFFER, 0, verts.nbytes, verts)
@@ -1127,13 +1041,6 @@ class MakerverseClient:
         self.connected = False
         self.teleport_req = None
         self.teleport_yaw = None
-        self.active_media_screen = None
-        self.media_focused = False
-        self.media_scroll_y = 0
-        self.media_paused = False
-        self.media_muted = False
-        self.media_active_tab = "EMBED"
-        self.media_status_note = ""
         self.running = True
 
     def _save_profile(self):
@@ -1196,70 +1103,6 @@ class MakerverseClient:
         self.avatar_requested[av_name] = now
         self.send_json({"type": "get_avatar", "name": av_name})
 
-    def find_nearby_or_looked_media(self, cam_pos, yaw_deg, pitch_deg) -> dict | None:
-        if self.looked_at_hit is not None:
-            hit_obj = self.looked_at_hit[0]
-            if isinstance(hit_obj.get("media"), dict):
-                return hit_obj["media"]
-        yr, pr = math.radians(yaw_deg), math.radians(pitch_deg)
-        cp = math.cos(pr)
-        look_dir = (-math.sin(yr) * cp, math.sin(pr), -math.cos(yr) * cp)
-        best_ms = None
-        best_score = 1e9
-        for ms in self.scene.get("media_screens", []):
-            mx, my, mz = ms.get("pos", (0.0, 0.0, 0.0))
-            dx, dy, dz = mx - cam_pos[0], my - cam_pos[1], mz - cam_pos[2]
-            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if dist <= 12.0 and dist > 1e-4:
-                nx, ny, nz = dx / dist, dy / dist, dz / dist
-                dot = nx * look_dir[0] + ny * look_dir[1] + nz * look_dir[2]
-                if dot > 0.65:
-                    score = dist * (2.0 - dot)
-                    if score < best_score:
-                        best_score = score
-                        best_ms = ms
-        return best_ms
-
-    def open_media_screen(self, ms: dict | None):
-        if not ms:
-            self.log("MEDIA", "#ffaa00", "No media screen in front of you. Aim at a wall screen or use /placemedia <url>.")
-            return
-        raw_u = str(ms.get("url", "") or "").strip()
-        ok_u, err_u = is_safe_media_url(raw_u, allow_unresolvable=True)
-        if not ok_u:
-            self.log("ERR", "#ff4444", f"Blocked unsafe media URL: {err_u}")
-            return
-        embed_u, detected_t = normalize_media_embed_url(raw_u)
-        self.active_media_screen = {
-            **ms,
-            "url": raw_u,
-            "embed_url": embed_u or raw_u,
-            "media_type": ms.get("media_type") or detected_t,
-        }
-        self.media_focused = True
-        self.media_scroll_y = 0
-        self.media_paused = False
-        self.media_active_tab = "YOUTUBE" if self.active_media_screen["media_type"] == "youtube" else "WEB PAGE"
-        self.media_status_note = f"Interactive {self.active_media_screen['media_type'].upper()} session active"
-        try:
-            pygame.event.set_grab(False)
-            pygame.mouse.set_visible(True)
-        except Exception:
-            pass
-        self.log("MEDIA", "#00ff66", f"Focused screen '{self.active_media_screen.get('title', 'Screen')}' -> {raw_u}")
-
-    def close_media_screen(self, restore_grab: bool = True):
-        self.active_media_screen = None
-        self.media_focused = False
-        self.media_scroll_y = 0
-        self.media_status_note = ""
-        if restore_grab:
-            try:
-                pygame.event.set_grab(True)
-                pygame.mouse.set_visible(False)
-            except Exception:
-                pass
-
     def _apply_world(self, world_name: str, md_text: str, desc: str = "", radio_url: str = "", radio_name: str = "", spawn_pos=None, spawn_yaw: float = 0.0, in_place: bool = False):
         self.world = world_name
         self.scene = parse_mv3d(md_text)
@@ -1273,11 +1116,6 @@ class MakerverseClient:
         self.world_desc = desc or self.scene.get("world_info_desc", "")
         store_cached_world(world_name, md_text)
         self.radio.set_stream(radio_url or self.scene.get("radio_url", ""), radio_name or self.scene.get("radio_name", ""))
-        if self.active_media_screen is not None:
-            cur_mid = str(self.active_media_screen.get("id", "") or "")
-            still_present = any(str(ms.get("id", "") or "") == cur_mid for ms in self.scene.get("media_screens", []))
-            if not still_present:
-                self.close_media_screen(restore_grab=False)
         if in_place:
             return
         self.portal_cooldown_until = time.time() + 2.0
@@ -1828,9 +1666,13 @@ class MakerverseClient:
                                 m_val = normalize_expression_name(str(data.get("mood", "neutral")))
                                 if sid_mo in self.peers:
                                     self.peers[sid_mo]["mood"] = m_val
+                            elif mtype == "mood_sync":
+                                sid_mo = str(data.get("short_id", "") or "")
+                                m_val = normalize_expression_name(str(data.get("mood", "neutral")))
+                                if sid_mo in self.peers:
+                                    self.peers[sid_mo]["mood"] = m_val
                             elif mtype == "media_sync":
                                 sid_m = str(data.get("screen_id", "") or "")
-                                cur_ms = self.active_media_screen or {}
                                 if sid_m and cur_ms.get("id") == sid_m:
                                     self.media_paused = bool(data.get("paused", self.media_paused))
                                     self.media_muted = bool(data.get("muted", self.media_muted))
@@ -2286,84 +2128,6 @@ def handle_command(client: MakerverseClient, text: str):
             client.log("WATCH", "#ffaa00", f"Stopped watching {fn_w}.")
         else:
             client.log("WATCH", "#ffaa00", "No active file watch.")
-    elif cmd == "/placemedia":
-        raw_m_args = text.strip().split()[1:]
-        if not raw_m_args:
-            client.log("ERR", "#ff4444", "Usage: /placemedia <https://url> [width] [height] [title]")
-            return
-        m_url = raw_m_args[0].strip()
-        ok_mu, err_mu = is_safe_media_url(m_url, allow_unresolvable=True)
-        if not ok_mu:
-            client.log("ERR", "#ff4444", err_mu)
-            return
-        nums_m = [float(x) for x in raw_m_args[1:] if re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", x)]
-        mw = max(0.5, min(50.0, nums_m[0])) if len(nums_m) >= 1 else 4.0
-        mh = max(0.5, min(50.0, nums_m[1])) if len(nums_m) >= 2 else 2.25
-        non_num_m = [x for x in raw_m_args[1:] if not re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", x)]
-        m_title = " ".join(non_num_m)[:64]
-        px, py, pz, yaw_p = client._front_placement_pos(dist=4.5, snap=True)
-        client.send_json({
-            "type": "world_edit",
-            "action": "place_media",
-            "world": client.world,
-            "url": m_url,
-            "x": px,
-            "y": py,
-            "z": pz,
-            "width": mw,
-            "height": mh,
-            "title": m_title,
-            "yaw": yaw_p,
-        })
-    elif cmd == "/media":
-        if len(parts) > 1 and parts[1].strip().lower() in ("close", "off", "exit"):
-            client.close_media_screen(restore_grab=True)
-            return
-        ms_target = client.find_nearby_or_looked_media(client.cam_pos_ref, client.cam_yaw_ref, 0.0)
-        if ms_target is None and client.scene.get("media_screens"):
-            ms_target = client.scene["media_screens"][0]
-        client.open_media_screen(ms_target)
-    elif cmd == "/closemedia":
-        client.close_media_screen(restore_grab=True)
-    elif cmd == "/listmedia":
-        screens = client.scene.get("media_screens", [])
-        if not screens:
-            client.log("MEDIA", "#ffaa00", f"No media screens in '{client.world}'. Use /placemedia <url>.")
-        else:
-            client.log("MEDIA", "#00ff66", f"Media screens in '{client.world}' ({len(screens)}):")
-            for idx_m, ms_item in enumerate(screens, 1):
-                m_id = str(ms_item.get("id", f"screen_{idx_m}"))
-                m_tit = str(ms_item.get("title", "Screen"))
-                m_tp = str(ms_item.get("media_type", "web")).upper()
-                m_u = str(ms_item.get("url", ""))
-                client.log("SCREEN", "#00ffcc", f"  {idx_m}. [{m_id}] {m_tit} ({m_tp}) -> {m_u}")
-    elif cmd == "/delmedia":
-        explicit_m = parts[1].strip() if len(parts) > 1 and parts[1].strip() else ""
-        tid = _target_placed_id(client, explicit_m)
-        if not tid and explicit_m:
-            # Match media screen by id or 1-based index
-            screens = client.scene.get("media_screens", [])
-            matched_ms = None
-            if explicit_m.isdigit():
-                idx_d = int(explicit_m) - 1
-                if 0 <= idx_d < len(screens):
-                    matched_ms = screens[idx_d]
-            else:
-                matched_ms = next((s for s in screens if str(s.get("id", "")).lower() == explicit_m.lower()), None)
-            if matched_ms:
-                cand_id = str(matched_ms.get("id", ""))
-                if cand_id.startswith("PLACED_"):
-                    tid = cand_id.split("_", 1)[1].lower()
-                elif re.fullmatch(r"[0-9a-fA-F]{4,8}", cand_id):
-                    tid = cand_id.lower()
-        if not tid:
-            ms_look = client.find_nearby_or_looked_media(client.cam_pos_ref, client.cam_yaw_ref, 0.0)
-            if ms_look and str(ms_look.get("id", "")).startswith("PLACED_"):
-                tid = str(ms_look["id"]).split("_", 1)[1].lower()
-        if tid:
-            client.send_json({"type": "world_edit", "action": "delete_placed", "world": client.world, "tag_id": tid})
-        else:
-            client.log("ERR", "#ff4444", "Aim at a placed media screen or pass /delmedia <id|#index>.")
     elif cmd == "/place":
         shape = parts[1].lower() if len(parts) > 1 else "box"
         color = parts[2] if len(parts) > 2 else "cyan"
@@ -2710,342 +2474,6 @@ def _sanitize_paste_text(raw_text: str, max_len: int = 300) -> str:
     return cleaned[:max_len]
 
 
-
-
-class _SimpleHTMLSummaryParser:
-    def __init__(self):
-        from html.parser import HTMLParser
-        class _P(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.in_title = False
-                self.skip_tag = 0
-                self.title = ""
-                self.meta_desc = ""
-                self.og_image = ""
-                self.lines = []
-                self._cur = []
-
-            def handle_starttag(self, tag, attrs):
-                t = tag.lower()
-                ad = {k.lower(): (v or "") for k, v in attrs}
-                if t in ("script", "style", "noscript", "svg"):
-                    self.skip_tag += 1
-                    return
-                if t == "title":
-                    self.in_title = True
-                elif t == "meta":
-                    prop = (ad.get("property") or ad.get("name") or "").lower()
-                    cont = ad.get("content", "").strip()
-                    if prop in ("description", "og:description", "twitter:description") and cont and not self.meta_desc:
-                        self.meta_desc = cont[:240]
-                    elif prop in ("og:image", "twitter:image") and cont and not self.og_image:
-                        self.og_image = cont[:500]
-                elif t in ("h1", "h2", "h3", "p", "li", "br", "tr", "div", "article", "section"):
-                    self._flush()
-
-            def handle_endtag(self, tag):
-                t = tag.lower()
-                if t in ("script", "style", "noscript", "svg") and self.skip_tag > 0:
-                    self.skip_tag -= 1
-                    return
-                if t == "title":
-                    self.in_title = False
-                elif t in ("h1", "h2", "h3", "p", "li", "tr"):
-                    self._flush()
-
-            def handle_data(self, data):
-                if self.skip_tag > 0:
-                    return
-                txt = " ".join(data.split())
-                if not txt:
-                    return
-                if self.in_title and len(self.title) < 120:
-                    self.title = (self.title + " " + txt).strip()
-                else:
-                    self._cur.append(txt)
-
-            def _flush(self):
-                if self._cur:
-                    line = " ".join(self._cur).strip()
-                    if line and len(self.lines) < 40:
-                        self.lines.append(line[:180])
-                    self._cur = []
-
-        self.parser = _P()
-
-    def feed_and_extract(self, html_text: str) -> dict:
-        self.parser.feed(html_text)
-        self.parser._flush()
-        return {
-            "title": self.parser.title,
-            "description": self.parser.meta_desc,
-            "og_image": self.parser.og_image,
-            "lines": self.parser.lines,
-        }
-
-
-def _extract_youtube_vid(url: str) -> str:
-    embed_u, kind = normalize_media_embed_url(url)
-    if kind == "youtube" and "/embed/" in embed_u:
-        return re.sub(r"[^a-zA-Z0-9_-]", "", embed_u.rsplit("/embed/", 1)[1])[:24]
-    return ""
-
-
-class MediaSurfaceManager:
-    """Fetches live website/image/YouTube previews asynchronously and renders crisp 768x432 textures for 3D wall screens and the 2D interactive viewer."""
-
-    def __init__(self):
-        self.entries: dict[str, dict] = {}
-        self.lock = threading.Lock()
-        self.gl_textures: dict[str, tuple[int, int]] = {}  # url -> (tex_id, version)
-
-    def clear_gl_textures(self):
-        for tex_id, _ in self.gl_textures.values():
-            try:
-                glDeleteTextures([tex_id])
-            except Exception:
-                pass
-        self.gl_textures.clear()
-
-    def request_media(self, spec: dict, force: bool = False):
-        url = str(spec.get("url", "") or "").strip()
-        if not url:
-            return
-        with self.lock:
-            cur = self.entries.get(url)
-            if cur and not force and (cur.get("status") in ("loading", "ready") or (time.time() - cur.get("fetched_at", 0.0) < 20.0)):
-                return
-            self.entries[url] = {
-                "url": url,
-                "embed_url": str(spec.get("embed_url") or url),
-                "title": str(spec.get("title") or "Media Screen"),
-                "media_type": str(spec.get("media_type") or "web"),
-                "status": "loading",
-                "page_title": str(spec.get("title") or url),
-                "description": "Fetching live preview...",
-                "lines": [],
-                "image_surf": None,
-                "fetched_at": time.time(),
-                "version": (cur.get("version", 0) + 1) if cur else 1,
-            }
-        threading.Thread(target=self._worker_fetch, args=(dict(spec),), daemon=True).start()
-
-    def _decode_image_surface(self, raw_bytes: bytes):
-        import io
-        try:
-            surf = pygame.image.load(io.BytesIO(raw_bytes))
-            return surf.convert_alpha()
-        except Exception:
-            pass
-        try:
-            from PIL import Image
-            im = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
-            im.thumbnail((768, 432))
-            return pygame.image.fromstring(im.tobytes(), im.size, "RGBA")
-        except Exception:
-            return None
-
-    def _fetch_bytes(self, target_url: str, max_bytes: int = 1_500_000) -> tuple[bytes, str]:
-        import urllib.request
-        ok_u, err_u = is_safe_media_url(target_url, allow_unresolvable=False)
-        if not ok_u:
-            raise ValueError(err_u)
-        req = urllib.request.Request(
-            target_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Makerverse-MV3D/2.0)",
-                "Accept": "text/html,application/xhtml+xml,image/*;q=0.9,*/*;q=0.8",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=7.5) as resp:
-            final_u = resp.geturl()
-            ok_f, err_f = is_safe_media_url(final_u, allow_unresolvable=True)
-            if not ok_f:
-                raise ValueError(err_f)
-            ctype = str(resp.headers.get("Content-Type", "") or "").lower()
-            data = resp.read(max_bytes)
-            return data, ctype
-
-    def _worker_fetch(self, spec: dict):
-        url = str(spec.get("url", "") or "").strip()
-        m_type = str(spec.get("media_type") or "web").lower()
-        yt_vid = _extract_youtube_vid(url) if m_type == "youtube" else ""
-        page_title = str(spec.get("title") or url)
-        desc = ""
-        lines: list[str] = []
-        img_surf = None
-        status = "ready"
-
-        try:
-            if yt_vid:
-                # Fetch YouTube oEmbed title + high-res thumbnail
-                oembed_url = f"https://www.youtube.com/oembed?url={urllib.parse.quote(url, safe='')}&format=json"
-                try:
-                    oe_bytes, _ = self._fetch_bytes(oembed_url, max_bytes=120_000)
-                    oe_json = json.loads(oe_bytes.decode("utf-8", errors="replace"))
-                    if oe_json.get("title"):
-                        page_title = str(oe_json["title"])[:100]
-                    if oe_json.get("author_name"):
-                        desc = f"Channel: {oe_json['author_name']}"
-                except Exception:
-                    pass
-                for thumb_u in (
-                    f"https://i.ytimg.com/vi/{yt_vid}/hqdefault.jpg",
-                    f"https://i.ytimg.com/vi/{yt_vid}/mqdefault.jpg",
-                ):
-                    try:
-                        t_bytes, _ = self._fetch_bytes(thumb_u, max_bytes=900_000)
-                        img_surf = self._decode_image_surface(t_bytes)
-                        if img_surf is not None:
-                            break
-                    except Exception:
-                        continue
-                lines = [
-                    f"YouTube Video ID: {yt_vid}",
-                    f"Embed Endpoint: https://www.youtube.com/embed/{yt_vid}",
-                    "Press [E] to focus controls or click OPEN IN BROWSER for full playback.",
-                ]
-            else:
-                raw_bytes, ctype = self._fetch_bytes(url, max_bytes=1_500_000)
-                if ctype.startswith("image/") or any(url.lower().split("?", 1)[0].endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
-                    img_surf = self._decode_image_surface(raw_bytes)
-                    desc = f"Live Image ({ctype or 'image'})"
-                else:
-                    html_txt = raw_bytes.decode("utf-8", errors="replace")
-                    parsed_html = _SimpleHTMLSummaryParser().feed_and_extract(html_txt)
-                    if parsed_html.get("title"):
-                        page_title = parsed_html["title"][:100]
-                    desc = parsed_html.get("description", "")
-                    lines = parsed_html.get("lines", [])
-                    og_u = parsed_html.get("og_image", "")
-                    if og_u:
-                        abs_og = urllib.parse.urljoin(url, og_u)
-                        try:
-                            og_bytes, _ = self._fetch_bytes(abs_og, max_bytes=900_000)
-                            img_surf = self._decode_image_surface(og_bytes)
-                        except Exception:
-                            pass
-        except Exception as exc:
-            status = "error"
-            desc = f"Preview offline ({type(exc).__name__}: {str(exc)[:90]})"
-            lines = [f"Target URL: {url}", "Click OPEN IN BROWSER to view directly."]
-
-        with self.lock:
-            cur = self.entries.get(url, {})
-            self.entries[url] = {
-                "url": url,
-                "embed_url": str(spec.get("embed_url") or url),
-                "title": str(spec.get("title") or page_title),
-                "media_type": m_type,
-                "status": status,
-                "page_title": page_title,
-                "description": desc,
-                "lines": lines,
-                "image_surf": img_surf,
-                "fetched_at": time.time(),
-                "version": cur.get("version", 0) + 1,
-            }
-
-    def compose_surface(self, spec: dict, font, scroll_y: int = 0, paused: bool = False, muted: bool = False) -> tuple[pygame.Surface, int]:
-        self.request_media(spec)
-        url = str(spec.get("url", "") or "").strip()
-        with self.lock:
-            entry = dict(self.entries.get(url, {}))
-        ver = int(entry.get("version", 1))
-        W, H = 768, 432
-        surf = pygame.Surface((W, H), pygame.SRCALPHA)
-        m_type = str(entry.get("media_type") or spec.get("media_type") or "web").upper()
-        accent = (255, 58, 92) if m_type == "YOUTUBE" else (0, 210, 255)
-
-        surf.fill((11, 16, 30, 255))
-        pygame.draw.rect(surf, (18, 28, 50, 255), (0, 0, W, 44))
-        pygame.draw.rect(surf, accent, (0, 42, W, 3))
-
-        badge = font.render(f" {m_type} ", True, (10, 14, 24))
-        pygame.draw.rect(surf, accent, (12, 10, badge.get_width() + 8, 24), border_radius=4)
-        surf.blit(badge, (16, 13))
-
-        hdr_title = str(entry.get("page_title") or spec.get("title") or url)[:54]
-        surf.blit(font.render(hdr_title, True, (235, 248, 255)), (badge.get_width() + 30, 13))
-
-        img_s = entry.get("image_surf")
-        body_y = 54
-        if img_s is not None:
-            iw, ih = img_s.get_size()
-            if iw > 0 and ih > 0:
-                max_h = 230 if entry.get("lines") else (H - 92)
-                scale = min((W - 28) / float(iw), max_h / float(ih))
-                nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-                scaled = pygame.transform.smoothscale(img_s, (nw, nh))
-                ix = (W - nw) // 2
-                surf.blit(scaled, (ix, body_y))
-                if m_type == "YOUTUBE":
-                    # Draw crisp YouTube play badge overlay
-                    cx, cy = W // 2, body_y + nh // 2
-                    pygame.draw.circle(surf, (230, 25, 55, 230), (cx, cy), 30)
-                    pygame.draw.polygon(surf, (255, 255, 255), [(cx - 9, cy - 13), (cx - 9, cy + 13), (cx + 15, cy)])
-                body_y += nh + 12
-
-        desc_txt = str(entry.get("description") or "")
-        if desc_txt:
-            for d_ln in _wrap_hud_line(font, desc_txt, W - 32)[:2]:
-                surf.blit(font.render(d_ln, True, (145, 235, 210)), (16, body_y))
-                body_y += 22
-
-        lines = entry.get("lines") or []
-        if not lines and img_s is None:
-            lines = [f"URL: {url}", "Press [E] to interact or open in your system browser."]
-
-        start_idx = max(0, scroll_y // 24)
-        for ln in lines[start_idx : start_idx + 12]:
-            if body_y > H - 46:
-                break
-            for w_ln in _wrap_hud_line(font, ln, W - 32)[:2]:
-                if body_y > H - 46:
-                    break
-                surf.blit(font.render(w_ln, True, (205, 222, 240)), (16, body_y))
-                body_y += 21
-
-        # Bottom status bar on the screen surface
-        pygame.draw.rect(surf, (15, 22, 40, 255), (0, H - 32, W, 32))
-        st_lbl = "PAUSED" if paused else "LIVE"
-        au_lbl = "MUTED" if muted else "AUDIO ON"
-        footer = f"[{st_lbl} | {au_lbl}]  {url}"
-        while font.size(footer)[0] > W - 28 and len(footer) > 16:
-            footer = footer[:-5] + "..."
-        surf.blit(font.render(footer, True, (130, 200, 230)), (14, H - 24))
-        return surf, ver
-
-    def get_gl_texture(self, spec: dict, font, scroll_y: int = 0, paused: bool = False, muted: bool = False) -> int:
-        url = str(spec.get("url", "") or "").strip()
-        self.request_media(spec)
-        with self.lock:
-            entry = self.entries.get(url, {})
-            ver = int(entry.get("version", 0))
-        scroll_step = max(0, int(scroll_y) // 24)
-        state_ver = (ver, scroll_step, bool(paused), bool(muted))
-        cached = self.gl_textures.get(url)
-        if cached and cached[1] == state_ver:
-            return cached[0]
-
-        surf, _ = self.compose_surface(spec, font, scroll_y=scroll_y, paused=paused, muted=muted)
-        w, h = surf.get_size()
-        raw = pygame.image.tostring(surf, "RGBA", True)
-        if cached:
-            tex = cached[0]
-        else:
-            tex = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, tex)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, raw)
-        self.gl_textures[url] = (tex, state_ver)
-        return tex
-
-
 def _wrap_hud_line(font, text: str, max_px: int) -> list[str]:
     if font.size(text)[0] <= max_px:
         return [text]
@@ -3222,9 +2650,6 @@ def main():
     font = _load_portable_font(15)
 
     renderer = ModernRenderer()
-    media_mgr = MediaSurfaceManager()
-    renderer.media_mgr = media_mgr
-    renderer.hud_font = font
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -3318,12 +2743,6 @@ def main():
                             client.hud_hidden = not client.hud_hidden
                         elif event.key == K_f:
                             client.trigger_interact(now)
-                        elif event.key == pygame.K_e:
-                            ms_hit = client.find_nearby_or_looked_media(cam_pos, yaw, pitch)
-                            if ms_hit is not None:
-                                client.open_media_screen(ms_hit)
-                            else:
-                                client.log("MEDIA", "#ffaa00", "Aim near a media wall screen or run /placemedia <url>.")
                         elif event.key == K_g:
                             client.grid_snap = 0.0 if client.grid_snap > 0.0 else 0.5
                             client.log("BUILD", "#00ff66", f"Grid snap: {client.grid_snap}m" if client.grid_snap > 0.0 else "Grid snap: OFF")
@@ -3340,65 +2759,11 @@ def main():
                             chat_mode = True
                             chat_buffer = "/" if event.key == K_SLASH else ""
                             pygame.event.set_grab(False); pygame.mouse.set_visible(True)
-                elif event.type == MOUSEMOTION and mouse_grabbed and not chat_mode and not client.media_focused:
+                elif event.type == MOUSEMOTION and mouse_grabbed and not chat_mode:
                     dx, dy = event.rel
                     yaw -= dx * 0.18
                     pitch = max(-85.0, min(85.0, pitch - dy * 0.18))
-                elif event.type == pygame.MOUSEBUTTONDOWN and client.media_focused and not chat_mode:
-                    mx_c, my_c = event.pos
-                    pw_m = min(860, max(540, WINDOW_W - 140))
-                    ph_m = min(500, max(340, WINDOW_H - 180))
-                    px_m = (WINDOW_W - pw_m) * 0.5
-                    py_m = (WINDOW_H - ph_m) * 0.5
-                    if event.button == 4:
-                        client.media_scroll_y = max(0, client.media_scroll_y - 36)
-                    elif event.button == 5:
-                        client.media_scroll_y = min(1200, client.media_scroll_y + 36)
-                    elif event.button == 1:
-                        # Close button at top-right of modal
-                        if px_m + pw_m - 76 <= mx_c <= px_m + pw_m - 12 and py_m + 10 <= my_c <= py_m + 36:
-                            client.close_media_screen(restore_grab=mouse_grabbed)
-                        # Play/Pause toggle button
-                        elif px_m + 18 <= mx_c <= px_m + 138 and py_m + ph_m - 44 <= my_c <= py_m + ph_m - 14:
-                            client.media_paused = not client.media_paused
-                            client.media_status_note = "Paused" if client.media_paused else "Playing / Active"
-                            ms_id = str((client.active_media_screen or {}).get("id", "") or "")
-                            if ms_id:
-                                client.send_json({"type": "media_sync", "screen_id": ms_id, "paused": client.media_paused, "muted": client.media_muted, "scroll_y": client.media_scroll_y})
-                        # Mute toggle button
-                        elif px_m + 148 <= mx_c <= px_m + 258 and py_m + ph_m - 44 <= my_c <= py_m + ph_m - 14:
-                            client.media_muted = not client.media_muted
-                            client.media_status_note = "Audio Muted" if client.media_muted else "Audio Unmuted"
-                            ms_id = str((client.active_media_screen or {}).get("id", "") or "")
-                            if ms_id:
-                                client.send_json({"type": "media_sync", "screen_id": ms_id, "paused": client.media_paused, "muted": client.media_muted, "scroll_y": client.media_scroll_y})
-                        # Scroll down button
-                        elif px_m + 268 <= mx_c <= px_m + 378 and py_m + ph_m - 44 <= my_c <= py_m + ph_m - 14:
-                            client.media_scroll_y = min(1200, client.media_scroll_y + 60)
-                            ms_id = str((client.active_media_screen or {}).get("id", "") or "")
-                            if ms_id:
-                                client.send_json({"type": "media_sync", "screen_id": ms_id, "paused": client.media_paused, "muted": client.media_muted, "scroll_y": client.media_scroll_y})
-                        # Open in external browser button
-                        elif px_m + pw_m - 210 <= mx_c <= px_m + pw_m - 14 and py_m + ph_m - 44 <= my_c <= py_m + ph_m - 14:
-                            import webbrowser
-                            target_launch = (client.active_media_screen or {}).get("url", "")
-                            ok_l, _ = is_safe_media_url(target_launch, allow_unresolvable=True)
-                            if ok_l:
-                                try:
-                                    webbrowser.open(target_launch, new=2)
-                                    client.media_status_note = f"Opened in browser: {target_launch}"
-                                except Exception as exc_b:
-                                    client.media_status_note = f"Browser launch failed: {exc_b}"
-
-            if client.media_focused and not chat_mode:
-                m_keys = pygame.key.get_pressed()
-                if m_keys[K_ESCAPE]:
-                    client.close_media_screen(restore_grab=mouse_grabbed)
-                elif m_keys[K_UP]:
-                    client.media_scroll_y = max(0, client.media_scroll_y - 6)
-                elif m_keys[K_DOWN]:
-                    client.media_scroll_y = min(1200, client.media_scroll_y + 6)
-            elif not chat_mode:
+            if not chat_mode:
                 keys = pygame.key.get_pressed()
                 speed = (12.0 if client.fly_mode else 7.5) * dt
                 rad = math.radians(yaw)
@@ -3473,9 +2838,6 @@ def main():
                 }
                 renderer.draw_object(grid_obj, vp_mat)
 
-            renderer.active_scroll_y = client.media_scroll_y
-            renderer.active_paused = client.media_paused
-            renderer.active_muted = client.media_muted
             for obj in client.scene.get("objects", []):
                 renderer.draw_object(obj, vp_mat)
 
@@ -3606,57 +2968,12 @@ def main():
                         renderer.draw_text_2d(font, ix + 10, iy + 32, f"XYZ ({hx_p:.1f}, {hy_p:.1f}, {hz_p:.1f}) - [R] Rot45 | /scaleobj /paint /delobj", (255, 150, 220))
                     else:
                         renderer.draw_text_2d(font, ix + 10, iy + 20, "INSPECT [I]: Aim reticle at an object", (160, 200, 190))
-                for ms in client.scene.get("media_screens", []):
-                    mx, my, mz = ms.get("pos", (0.0, 0.0, 0.0))
-                    pt2 = project_3d_to_2d((mx, my + float(ms.get("height", 2.25)) * 0.5 + 0.35, mz), vp_mat)
-                    if pt2:
-                        mlbl = f"[{ms.get('media_type', 'web').upper()}] {ms.get('title', 'Screen')} - [E] Interact"
-                        mw_px = font.size(mlbl)[0] + 12
-                        renderer.draw_rect_2d(pt2[0] - mw_px * 0.5, pt2[1] - 11, mw_px, 22, (0.03, 0.06, 0.14, 0.88))
-                        renderer.draw_text_2d(font, pt2[0] - mw_px * 0.5 + 6, pt2[1] - 9, mlbl, (90, 225, 255))
-
-                if client.media_focused and client.active_media_screen:
-                    ms_cur = client.active_media_screen
-                    pw_m = min(860, max(540, WINDOW_W - 140))
-                    ph_m = min(500, max(340, WINDOW_H - 180))
-                    px_m = (WINDOW_W - pw_m) * 0.5
-                    py_m = (WINDOW_H - ph_m) * 0.5
-                    renderer.draw_rect_2d(px_m, py_m, pw_m, ph_m, (0.04, 0.05, 0.11, 0.96))
-                    renderer.draw_rect_2d(px_m, py_m, pw_m, 44, (0.08, 0.12, 0.22, 0.98))
-                    renderer.draw_text_2d(font, px_m + 16, py_m + 13, f"{ms_cur.get('title', 'Media Screen')} [{ms_cur.get('media_type', 'web').upper()}]", (0, 255, 204))
-                    renderer.draw_rect_2d(px_m + pw_m - 76, py_m + 10, 64, 26, (0.55, 0.12, 0.22, 0.95))
-                    renderer.draw_text_2d(font, px_m + pw_m - 64, py_m + 15, "CLOSE", (255, 230, 235))
-
-                    # Viewport area (renders live fetched webpage / image / YouTube preview texture)
-                    vp_x, vp_y, vp_w, vp_h = px_m + 18, py_m + 56, pw_m - 36, ph_m - 110
-                    renderer.draw_rect_2d(vp_x, vp_y, vp_w, vp_h, (0.02, 0.03, 0.07, 0.98))
-                    modal_tex = media_mgr.get_gl_texture(
-                        ms_cur,
-                        font,
-                        scroll_y=client.media_scroll_y,
-                        paused=client.media_paused,
-                        muted=client.media_muted,
-                    )
-                    if modal_tex:
-                        renderer.draw_tex_2d(vp_x, vp_y, vp_w, vp_h, modal_tex)
-
-                    # Interactive control bar at bottom of modal
-                    renderer.draw_rect_2d(px_m + 18, py_m + ph_m - 44, 120, 30, (0.12, 0.28, 0.24, 0.95))
-                    renderer.draw_text_2d(font, px_m + 28, py_m + ph_m - 37, "PLAY/PAUSE", (180, 255, 220))
-                    renderer.draw_rect_2d(px_m + 148, py_m + ph_m - 44, 110, 30, (0.14, 0.20, 0.34, 0.95))
-                    renderer.draw_text_2d(font, px_m + 158, py_m + ph_m - 37, "MUTE/AUDIO", (190, 220, 255))
-                    renderer.draw_rect_2d(px_m + 268, py_m + ph_m - 44, 110, 30, (0.20, 0.18, 0.34, 0.95))
-                    renderer.draw_text_2d(font, px_m + 278, py_m + ph_m - 37, "SCROLL DN", (225, 200, 255))
-                    renderer.draw_rect_2d(px_m + pw_m - 210, py_m + ph_m - 44, 196, 30, (0.10, 0.36, 0.55, 0.95))
-                    renderer.draw_text_2d(font, px_m + pw_m - 198, py_m + ph_m - 37, "OPEN IN BROWSER", (220, 245, 255))
-
                 glEnable(GL_DEPTH_TEST)
 
             pygame.display.flip()
     finally:
         client.running = False
         client.radio.stop()
-        media_mgr.clear_gl_textures()
         renderer.clear_dynamic_vaos()
         pygame.quit()
 

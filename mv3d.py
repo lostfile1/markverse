@@ -373,7 +373,6 @@ def parse_mv3d(md_text: str) -> dict:
         "objects": [],
         "portals": [],
         "triggers": [],
-        "media_screens": [],
         "has_floor": False,
         "raw_len": len(md_text or ""),
         "raw_preview": "",
@@ -724,7 +723,6 @@ def parse_mv3d(md_text: str) -> dict:
                         inst["pos"] = nudge_pos
                         ms_inst = {
                             **inst["media"],
-                            "id": cur["def_name"] or f"media_{len(scene['media_screens'])}",
                             "pos": nudge_pos,
                             "rot": inst["rot"],
                             "scale": inst["scale"],
@@ -732,7 +730,6 @@ def parse_mv3d(md_text: str) -> dict:
                             "height": inst["media"]["height"] * inst["scale"][1],
                         }
                         inst["media"] = ms_inst
-                        scene["media_screens"].append(ms_inst)
                     scene["objects"].append(inst)
         elif prop in ("media", "screen", "embed") and isinstance(val, dict):
             raw_u = str(val.get("url", "") or val.get("src", "")).strip()
@@ -749,7 +746,6 @@ def parse_mv3d(md_text: str) -> dict:
             if m_face not in ("front", "back", "left", "right", "both"):
                 m_face = "front"
             media_spec = {
-                "id": cur["def_name"] or f"media_{len(scene['media_screens'])}",
                 "url": raw_u[:500],
                 "embed_url": safe_u[:500],
                 "media_type": m_type,
@@ -796,7 +792,6 @@ def parse_mv3d(md_text: str) -> dict:
                     "rel_scale": r_scale,
                 })
             else:
-                scene["media_screens"].append(media_spec)
                 scene["objects"].append(media_obj)
         elif prop in ("box", "sphere", "cylinder", "cone", "grid", "mesh", "sign") and isinstance(val, dict):
             diff = parse_color(val.get("color", "#73a6d9"))
@@ -912,7 +907,6 @@ def validate_mv3d_document(content: str, kind: str = "world") -> tuple[bool, str
     if kind == "avatar" and len(objs) > 128:
         return False, f"Avatar has {len(objs)} primitives (max 128 allowed).", warnings
 
-    for ms in parsed.get("media_screens", []):
         u_chk = ms.get("url", "")
         if u_chk:
             ok_u, err_u = is_safe_media_url(u_chk, allow_unresolvable=True)
