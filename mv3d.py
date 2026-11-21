@@ -1,7 +1,10 @@
 import hashlib
+import ipaddress
 import math
 import re
 import secrets
+import socket
+import urllib.parse
 
 MAX_SCENE_OBJECTS = 4096
 MAX_NESTING_DEPTH = 12
@@ -247,6 +250,116 @@ def _rot_list_to_quat(rot_val):
     return (0.0, 0.0, 0.0, 1.0)
 
 
+
+
+def is_safe_media_url(url: str, allow_unresolvable: bool = False) -> tuple[bool, str]:
+    raw = str(url or "").strip()
+    if not raw or len(raw) > 500 or any(ch in raw for ch in ('"', "'", "\n", "\r", "\x00", " ")):
+        return False, "Media URL is invalid or contains forbidden characters."
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except Exception:
+        return False, "Malformed media URL."
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False, "Media URL must use http:// or https://."
+    host = parsed.hostname.strip().lower()
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".local"):
+        return False, "Localhost and .local media URLs are blocked."
+    try:
+        ip_literal = ipaddress.ip_address(host)
+        if (
+            ip_literal.is_private
+            or ip_literal.is_loopback
+            or ip_literal.is_link_local
+            or ip_literal.is_multicast
+            or ip_literal.is_reserved
+            or ip_literal.is_unspecified
+        ):
+            return False, "Private, loopback, link-local, or unspecified IPs are blocked for embedded media."
+        return True, ""
+    except ValueError:
+        pass
+    if allow_unresolvable:
+        return True, ""
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False, f"Cannot resolve media host '{host}'."
+    for info in infos:
+        try:
+            ip_obj = ipaddress.ip_address(info[4][0])
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_multicast
+                or ip_obj.is_reserved
+                or ip_obj.is_unspecified
+            ):
+                return False, "Blocked private/loopback IP for embedded media."
+        except ValueError:
+            return False, "Invalid resolved IP address for media host."
+    return True, ""
+
+
+def normalize_media_embed_url(url: str) -> tuple[str, str]:
+    """Returns (embed_or_watch_url, detected_type) where detected_type is 'youtube' or 'web'."""
+    raw = str(url or "").strip()
+    ok, _ = is_safe_media_url(raw, allow_unresolvable=True)
+    if not ok:
+        return "", "web"
+    try:
+        sp = urllib.parse.urlsplit(raw)
+    except Exception:
+        return raw, "web"
+    host = (sp.hostname or "").lower()
+    path = sp.path or ""
+    qs = urllib.parse.parse_qs(sp.query or "")
+    vid = ""
+    if host in ("youtu.be", "www.youtu.be"):
+        vid = path.strip("/").split("/", 1)[0]
+    elif host.endswith("youtube.com"):
+        if path.startswith("/watch"):
+            vid = (qs.get("v") or [""])[0]
+        elif path.startswith("/embed/"):
+            vid = path.split("/embed/", 1)[1].split("/", 1)[0]
+        elif path.startswith("/shorts/") or path.startswith("/live/"):
+            parts_p = path.strip("/").split("/")
+            if len(parts_p) >= 2:
+                vid = parts_p[1]
+    clean_vid = re.sub(r"[^a-zA-Z0-9_-]", "", vid)[:24]
+    if clean_vid:
+        return f"https://www.youtube.com/embed/{clean_vid}", "youtube"
+    return raw, "web"
+
+
+EXPRESSION_ALIASES = {
+    "neutral": "neutral",
+    "default": "neutral",
+    "reset": "neutral",
+    "normal": "neutral",
+    "happy": "happy",
+    "smile": "happy",
+    "joy": "happy",
+    "smirk": "smirk",
+    "grin": "smirk",
+    "angry": "angry",
+    "mad": "angry",
+    "frown": "angry",
+    "surprised": "surprised",
+    "surprise": "surprised",
+    "shock": "surprised",
+    "wow": "surprised",
+}
+
+
+def normalize_expression_name(raw_expr: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw_expr or "")).strip().lower()
+    if not cleaned:
+        return "neutral"
+    return EXPRESSION_ALIASES.get(cleaned, cleaned[:24])
+
+
 def parse_mv3d(md_text: str) -> dict:
     """Single-pass hardened parser for Makerverse 3D Markdown (#MV3D) worlds and avatars.
     Supports portals, interactive triggers, 3D sign billboards, sky/fog, radio, and @def/@use templates.
@@ -260,6 +373,7 @@ def parse_mv3d(md_text: str) -> dict:
         "objects": [],
         "portals": [],
         "triggers": [],
+        "media_screens": [],
         "has_floor": False,
         "raw_len": len(md_text or ""),
         "raw_preview": "",
@@ -340,6 +454,7 @@ def parse_mv3d(md_text: str) -> dict:
         "local_pos": (0.0, 0.0, 0.0),
         "local_quat": (0.0, 0.0, 0.0, 1.0),
         "local_scale": (1.0, 1.0, 1.0),
+        "expressions": [],
         "is_def": False,
         "def_name": "",
         "records": [],
@@ -406,6 +521,14 @@ def parse_mv3d(md_text: str) -> dict:
             else:
                 def_label = header_txt
 
+            hdr_exprs = []
+            for m_ex in re.finditer(r"\[(?:expr|expression|mood):\s*([a-zA-Z0-9_-]+)\]", header_txt, re.I):
+                ne = normalize_expression_name(m_ex.group(1))
+                if ne and ne not in hdr_exprs:
+                    hdr_exprs.append(ne)
+            if not hdr_exprs and parent.get("expressions"):
+                hdr_exprs = list(parent["expressions"])
+
             node = {
                 "depth": depth,
                 "name": header_txt,
@@ -415,6 +538,7 @@ def parse_mv3d(md_text: str) -> dict:
                 "pos": parent["pos"],
                 "quat": parent["quat"],
                 "scale": parent["scale"],
+                "expressions": hdr_exprs,
                 "is_def": is_def,
                 "def_name": def_label,
                 "records": [],
@@ -451,6 +575,17 @@ def parse_mv3d(md_text: str) -> dict:
                     _finite_float(val[2], 1.0, 0.05, MAX_SCALE_VAL),
                 )
             _recompute_world_transform(cur, parent)
+        elif prop in ("expression", "mood"):
+            ne = normalize_expression_name(str(val))
+            cur["expressions"] = [ne] if ne else []
+        elif prop == "expressions":
+            raw_elist = val if isinstance(val, list) else [val]
+            elist = []
+            for item_e in raw_elist:
+                ne = normalize_expression_name(str(item_e))
+                if ne and ne not in elist:
+                    elist.append(ne)
+            cur["expressions"] = elist
         elif prop == "portal" and isinstance(val, dict):
             dest_w = re.sub(r"[^a-zA-Z0-9_-]", "", str(val.get("to", "hub")))[:32] or "hub"
             rad = _finite_float(val.get("radius", 2.0), 2.0, 0.5, 15.0)
@@ -579,7 +714,90 @@ def parse_mv3d(md_text: str) -> dict:
                         "rel_scale": (r_scale[0] * tmpl["rel_scale"][0], r_scale[1] * tmpl["rel_scale"][1], r_scale[2] * tmpl["rel_scale"][2]),
                     })
                 else:
+                    if isinstance(inst.get("media"), dict):
+                        z_nudge_u = _quat_rotate_vec(comp_q, (0.0, 0.0, 0.06))
+                        nudge_pos = (
+                            inst["pos"][0] + z_nudge_u[0],
+                            inst["pos"][1] + z_nudge_u[1],
+                            inst["pos"][2] + z_nudge_u[2],
+                        )
+                        inst["pos"] = nudge_pos
+                        ms_inst = {
+                            **inst["media"],
+                            "id": cur["def_name"] or f"media_{len(scene['media_screens'])}",
+                            "pos": nudge_pos,
+                            "rot": inst["rot"],
+                            "scale": inst["scale"],
+                            "width": inst["media"]["width"] * inst["scale"][0],
+                            "height": inst["media"]["height"] * inst["scale"][1],
+                        }
+                        inst["media"] = ms_inst
+                        scene["media_screens"].append(ms_inst)
                     scene["objects"].append(inst)
+        elif prop in ("media", "screen", "embed") and isinstance(val, dict):
+            raw_u = str(val.get("url", "") or val.get("src", "")).strip()
+            safe_u, auto_kind = normalize_media_embed_url(raw_u)
+            req_t = str(val.get("type", auto_kind)).strip().lower()
+            m_type = "youtube" if (req_t == "youtube" or auto_kind == "youtube") else "web"
+            mw = _finite_float(val.get("width", 4.0), 4.0, 0.5, 50.0)
+            mh = _finite_float(val.get("height", 2.25), 2.25, 0.5, 50.0)
+            m_title = re.sub(r"[\x00-\x1f\x7f]", " ", str(val.get("title", "") or cur["def_name"] or m_type.upper())).strip()[:64]
+            m_inter = bool(val.get("interactive", True))
+            m_col = parse_color(val.get("color", "#101828"))
+            m_glow = parse_color(val.get("glow", "#00ffd9" if m_type == "youtube" else "#00aaff"), default=(0.0, 0.4, 0.6))
+            m_face = str(val.get("face", "front")).strip().lower()
+            if m_face not in ("front", "back", "left", "right", "both"):
+                m_face = "front"
+            media_spec = {
+                "id": cur["def_name"] or f"media_{len(scene['media_screens'])}",
+                "url": raw_u[:500],
+                "embed_url": safe_u[:500],
+                "media_type": m_type,
+                "width": mw,
+                "height": mh,
+                "title": m_title,
+                "interactive": m_inter,
+                "face": m_face,
+                "pos": cur["pos"],
+                "rot": _quat_to_axis_angle_deg(cur["quat"]),
+                "scale": cur["scale"],
+            }
+            z_nudge = _quat_rotate_vec(cur["quat"], (0.0, 0.0, 0.06))
+            screen_pos = (cur["pos"][0] + z_nudge[0], cur["pos"][1] + z_nudge[1], cur["pos"][2] + z_nudge[2])
+            media_spec["pos"] = screen_pos
+            media_obj = {
+                "kind": "box",
+                "node_name": cur["name"],
+                "pos": screen_pos,
+                "rot": _quat_to_axis_angle_deg(cur["quat"]),
+                "scale": cur["scale"],
+                "size": (mw, mh, 0.06),
+                "diff": m_col,
+                "emis": m_glow,
+                "alpha": 0.94,
+                "def_name": cur["def_name"],
+                "media": media_spec,
+            }
+            def_anc_m = next((n for n in reversed(stack) if n["is_def"]), None)
+            if def_anc_m is not None:
+                if cur is def_anc_m:
+                    r_pos, r_quat, r_scale = cur["local_pos"], cur["local_quat"], cur["local_scale"]
+                else:
+                    r_pos, r_quat, r_scale = _relative_to_ancestor(cur, def_anc_m)
+                    r_pos = (
+                        def_anc_m["local_pos"][0] + r_pos[0],
+                        def_anc_m["local_pos"][1] + r_pos[1],
+                        def_anc_m["local_pos"][2] + r_pos[2],
+                    )
+                def_anc_m["records"].append({
+                    **media_obj,
+                    "rel_pos": r_pos,
+                    "rel_quat": r_quat,
+                    "rel_scale": r_scale,
+                })
+            else:
+                scene["media_screens"].append(media_spec)
+                scene["objects"].append(media_obj)
         elif prop in ("box", "sphere", "cylinder", "cone", "grid", "mesh", "sign") and isinstance(val, dict):
             diff = parse_color(val.get("color", "#73a6d9"))
             emis = parse_color(val.get("glow", "#000000"), default=(0.0, 0.0, 0.0))
@@ -594,6 +812,7 @@ def parse_mv3d(md_text: str) -> dict:
                 "emis": emis,
                 "alpha": alpha,
                 "def_name": cur["def_name"],
+                "expressions": list(cur.get("expressions") or []),
             }
             if prop == "sign":
                 label_txt = re.sub(r"[\x00-\x1f\x7f]", " ", str(val.get("text", cur["def_name"] or "SIGN"))).strip()[:48]
@@ -692,6 +911,13 @@ def validate_mv3d_document(content: str, kind: str = "world") -> tuple[bool, str
 
     if kind == "avatar" and len(objs) > 128:
         return False, f"Avatar has {len(objs)} primitives (max 128 allowed).", warnings
+
+    for ms in parsed.get("media_screens", []):
+        u_chk = ms.get("url", "")
+        if u_chk:
+            ok_u, err_u = is_safe_media_url(u_chk, allow_unresolvable=True)
+            if not ok_u:
+                return False, f"Invalid embedded media URL ({err_u}).", warnings
 
     kb = max(1, len(clean.encode("utf-8", errors="replace")) // 1024)
     warnings.insert(0, f"{len(objs)} primitive(s), {kb} KB - valid #MV3D scene.")
@@ -1016,6 +1242,11 @@ def build_default_hub_md() -> str:
         "# Node: NexusSign",
         "* **pos**: [0, 3.6, -5.5]",
         '* **sign**: { text: "MAKERVERSE NEXUS", color: "#00ffd9", glow: "#006655" }',
+        "",
+        "# Node: WelcomeScreen",
+        "* **pos**: [9.5, 2.35, -7.5]",
+        "* **rot**: [0, -32, 0]",
+        '* **media**: { url: "https://example.org", type: "web", width: 4.2, height: 2.36, title: "NEXUS WEB MONITOR", glow: "#00b8ff", interactive: true }',
     ])
     return "\n".join(lines) + "\n"
 
@@ -1163,3 +1394,39 @@ def build_stamped_prefab_snippet(
         f"* **@use**: {def_key}"
     )
     return snippet, tid
+
+def build_placed_media_snippet(
+    url: str,
+    x: float,
+    y: float,
+    z: float,
+    creator_nick: str,
+    media_type: str = "auto",
+    width: float = 4.0,
+    height: float = 2.25,
+    title: str = "",
+    tag_id: str | None = None,
+    yaw_deg: float = 0.0,
+) -> str:
+    tid = (tag_id or secrets.token_hex(3)).lower()
+    safe_nick = re.sub(r"[^a-zA-Z0-9_-]", "", creator_nick)[:24] or "builder"
+    safe_url = re.sub(r'[\x00-\x1f\x7f"\\]', "", str(url or "").strip())[:500]
+    _, auto_t = normalize_media_embed_url(safe_url)
+    m_type = "youtube" if (str(media_type).lower() == "youtube" or auto_t == "youtube") else "web"
+    w_val = round(_finite_float(width, 4.0, 0.5, 50.0), 2)
+    h_val = round(_finite_float(height, 2.25, 0.5, 50.0), 2)
+    clean_title = re.sub(r'[\x00-\x1f\x7f"\\]', " ", str(title or m_type.upper())).strip()[:64]
+    px = _finite_float(x, 0.0, -500.0, 500.0)
+    cy = round(_finite_float(y, 0.0, -100.0, 500.0) + h_val * 0.5, 3)
+    pz = _finite_float(z, 0.0, -500.0, 500.0)
+    yaw = round(_finite_float(yaw_deg, 0.0) % 360.0, 1)
+    glow_hex = "#ff2442" if m_type == "youtube" else "#00b8ff"
+
+    return (
+        f"<!-- PLACED:{tid} by {safe_nick} media:{m_type} -->\n"
+        f"# Node: PLACED_{tid}\n"
+        f"* **pos**: [{px:.3f}, {cy:.3f}, {pz:.3f}]\n"
+        f"* **rot**: [0, {yaw}, 0]\n"
+        f"* **scale**: [1.0, 1.0, 1.0]\n"
+        f'* **media**: {{ url: "{safe_url}", type: "{m_type}", width: {w_val}, height: {h_val}, title: "{clean_title}", glow: "{glow_hex}", interactive: true }}'
+    )

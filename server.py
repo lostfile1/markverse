@@ -16,8 +16,10 @@ from nacl.exceptions import BadSignatureError
 from mv3d import (
     _finite_int,
     build_default_hub_md,
+    build_placed_media_snippet,
     build_placed_mv3d_snippet,
     build_placed_portal_snippet,
+    is_safe_media_url,
     compute_md_sha256,
     build_stamped_prefab_snippet,
     extract_placed_blueprint_md,
@@ -56,6 +58,8 @@ MAX_PREFABS_TOTAL = 256
 
 RATE_LIMITS = {
     "move": (30, 1.0),
+    "media_sync": (20, 5.0),
+    "mood_sync": (20, 5.0),
     "chat": (6, 4.0),
     "upload": (4, 30.0),
     "world_backup": (6, 15.0),
@@ -997,6 +1001,29 @@ async def handler(websocket):
                     "rot": client_state["rot"],
                 }, exclude_ws=websocket)
 
+            elif msg_type == "media_sync":
+                screen_id = sanitize_name(str(data.get("screen_id", "")))
+                if screen_id:
+                    await broadcast_world(client_state["world"], {
+                        "type": "media_sync",
+                        "short_id": client_state["short_id"],
+                        "nick": client_state["nick"],
+                        "screen_id": screen_id,
+                        "paused": bool(data.get("paused", False)),
+                        "muted": bool(data.get("muted", False)),
+                        "scroll_y": _finite_int(data.get("scroll_y", 0), 0, 0, 2000),
+                    }, exclude_ws=websocket)
+
+            elif msg_type == "mood_sync":
+                mood_val = sanitize_name(str(data.get("mood", "neutral"))).lower()[:24] or "neutral"
+                client_state["mood"] = mood_val
+                await broadcast_world(client_state["world"], {
+                    "type": "mood_sync",
+                    "short_id": client_state["short_id"],
+                    "nick": client_state["nick"],
+                    "mood": mood_val,
+                }, exclude_ws=websocket)
+
             elif msg_type == "chat":
                 text = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("text", "")))[:300].strip()
                 if not text:
@@ -1274,6 +1301,46 @@ async def handler(websocket):
                             if dest_fp is None or not dest_fp.exists():
                                 warn_missing = f" (note: local world '{dest_w}' does not exist yet)"
                         await websocket.send(json.dumps({"type": "info", "msg": f"Placed portal [{tid}] -> {dest_label} at ({px:.1f}, {py:.1f}, {pz:.1f}){warn_missing}."}))
+
+                    elif action == "place_media":
+                        m_url = str(data.get("url", "") or "").strip()
+                        ok_m, err_m = is_safe_media_url(m_url, allow_unresolvable=True)
+                        if not ok_m:
+                            await websocket.send(json.dumps({"type": "error", "msg": err_m}))
+                            continue
+                        raw_pm = (data.get("x", 0.0), data.get("y", 0.0), data.get("z", -4.0), data.get("width", 4.0), data.get("height", 2.25), data.get("yaw", 0.0))
+                        if not all(_is_finite_num(v) for v in raw_pm):
+                            await websocket.send(json.dumps({"type": "error", "msg": "Invalid media screen position or dimensions."}))
+                            continue
+                        px = max(-500.0, min(500.0, float(raw_pm[0])))
+                        py = max(-100.0, min(500.0, float(raw_pm[1])))
+                        pz = max(-500.0, min(500.0, float(raw_pm[2])))
+                        mw = max(0.5, min(50.0, float(raw_pm[3])))
+                        mh = max(0.5, min(50.0, float(raw_pm[4])))
+                        yaw_deg = float(raw_pm[5])
+                        cur_md = read_md_safe(md_path)
+                        if len(cur_md.encode("utf-8", errors="replace")) > MAX_FILE_SIZE - 4096:
+                            await websocket.send(json.dumps({"type": "error", "msg": "World size limit reached."}))
+                            continue
+                        create_world_snapshot(target, label="auto")
+                        tid = secrets.token_hex(3)
+                        snippet = build_placed_media_snippet(
+                            url=m_url,
+                            x=px,
+                            y=py,
+                            z=pz,
+                            creator_nick=client_state["nick"],
+                            media_type=str(data.get("media_type", "auto")),
+                            width=mw,
+                            height=mh,
+                            title=str(data.get("title", "")),
+                            tag_id=tid,
+                            yaw_deg=yaw_deg,
+                        )
+                        updated_md = cur_md.rstrip() + f"\n\n{snippet}\n"
+                        _atomic_write_text(md_path, updated_md)
+                        await broadcast_world(target, _world_update_msg(updated_md))
+                        await websocket.send(json.dumps({"type": "info", "msg": f"Placed media screen [{tid}] at ({px:.1f}, {py:.1f}, {pz:.1f})."}))
 
                     elif action == "mutate_placed":
                         tag_id = re.sub(r"[^a-fA-F0-9]", "", str(data.get("tag_id", ""))).lower()
