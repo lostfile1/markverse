@@ -1020,6 +1020,7 @@ class MakerverseClient:
         self.prev_server = None
         self.reconnect_target = None
         self.active_ws = None
+        self._connect_task = None
         self.out_queue = asyncio.Queue()
         self.loop = None
         self.connected = False
@@ -1190,12 +1191,16 @@ class MakerverseClient:
                 break
 
     def _trigger_ws_reconnect(self):
-        if self.loop and not self.loop.is_closed() and self.active_ws is not None:
+        if self.loop and not self.loop.is_closed():
             ws_ref = self.active_ws
+            ct_ref = self._connect_task
+            def _do_close():
+                if ct_ref is not None and not ct_ref.done():
+                    ct_ref.cancel()
+                if ws_ref is not None:
+                    asyncio.create_task(ws_ref.close())
             try:
-                self.loop.call_soon_threadsafe(
-                    lambda w=ws_ref: asyncio.create_task(w.close())
-                )
+                self.loop.call_soon_threadsafe(_do_close)
             except RuntimeError:
                 pass
 
@@ -1206,6 +1211,19 @@ class MakerverseClient:
         sdir["recent"] = recent[:12]
         save_server_directory(sdir)
 
+    def _drain_out_queue(self):
+        if self.loop and not self.loop.is_closed():
+            def _clear():
+                while not self.out_queue.empty():
+                    try:
+                        self.out_queue.get_nowait()
+                    except Exception:
+                        break
+            try:
+                self.loop.call_soon_threadsafe(_clear)
+            except RuntimeError:
+                pass
+
     def hop_to_server(self, target_url: str, target_world: str = "hub", spawn_pos=None, spawn_yaw=None):
         norm_url = normalize_ws_url(target_url)
         if not norm_url:
@@ -1213,6 +1231,7 @@ class MakerverseClient:
             return
         self.peers.clear()
         self.radio.stop()
+        self._drain_out_queue()
         if self.server_url and self.server_url != norm_url:
             self.prev_server = (self.server_url, self.world or "hub")
         self.reconnect_target = (norm_url, target_world or "hub", spawn_pos, spawn_yaw)
@@ -1294,7 +1313,8 @@ class MakerverseClient:
                 self.server_url, target_world, target_spawn, target_yaw = self.reconnect_target
                 self.reconnect_target = None
             try:
-                async with websockets.connect(self.server_url, max_size=6 * 1024 * 1024, ping_interval=20, ping_timeout=20) as ws:
+                self._connect_task = asyncio.current_task()
+                async with websockets.connect(self.server_url, open_timeout=10.0, max_size=6 * 1024 * 1024, ping_interval=20, ping_timeout=20) as ws:
                     self.active_ws = ws
                     self.connected = True
                     async def sender():
@@ -1391,33 +1411,75 @@ class MakerverseClient:
                                         self.log("WORLD", "#00ffcc", f"  - {w_nm}{o_tag}{r_tag}{t_tag}{d_tag}")
                             elif mtype == "world_info":
                                 w_nm = data.get("world", self.world)
-                                owner = data.get("owner")
-                                sp_pos = data.get("spawn_pos", [0.0, 2.25, 13.5])
-                                players = data.get("players", [])
-                                cbs = data.get("co_builders", [])
+                                title_s = str(data.get("title") or w_nm).strip()
+                                title_hdr = f"{title_s} ({w_nm})" if title_s.lower() != w_nm.lower() else w_nm
+                                vis_lbl = "PRIVATE" if data.get("private") else "PUBLIC"
                                 cnt_r = int(data.get("rating_count", 0) or 0)
                                 avg_r = float(data.get("avg_rating", 0.0) or 0.0)
-                                rat_str = f" | Rating: {avg_r:.1f}/5 ({cnt_r})" if cnt_r > 0 else ""
-                                self.log("WORLD-INFO", "#00ff66", f"=== {data.get('title', w_nm)} ({w_nm}) [{'PRIVATE' if data.get('private') else 'PUBLIC'}]{rat_str} | {max(1, int(data.get('bytes', 0)) // 1024)} KB | {int(data.get('snapshots_count', 0))} snaps ===")
-                                self.log("DESC", "#00ffcc", f"Description: {data.get('description') or '(none set)'}" + (f" | Tags: {', '.join(data.get('tags', []))}" if data.get("tags") else ""))
+                                rat_str = f"  |  Rating: {avg_r:.1f}/5 ({cnt_r} vote{'s' if cnt_r != 1 else ''})" if cnt_r > 0 else "  |  Unrated"
+                                self.log("WORLD", "#00ff66", f"{title_hdr}  [{vis_lbl}]{rat_str}")
+
+                                desc_s = str(data.get("description") or "").strip() or "No description set."
+                                tags_l = [str(t).strip() for t in data.get("tags", []) if str(t).strip()]
+                                tags_s = f"  |  Tags: {' '.join('#' + t for t in tags_l)}" if tags_l else ""
+                                self.log("ABOUT", "#00ffcc", f"{desc_s}{tags_s}")
+
+                                owner = data.get("owner")
+                                upd_ts = int(data.get("updated_at", 0) or 0)
+                                upd_str = f"  |  Updated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(upd_ts))}" if upd_ts > 0 else ""
                                 if data.get("is_system") and not owner:
-                                    self.log("CREATOR", "#00ffcc", "Created by: Neo-Genesis Grid (Core System World)")
+                                    self.log("AUTHOR", "#88ccff", f"Neo-Genesis Grid (System World){upd_str}")
                                 elif owner:
                                     on_tag = " [ONLINE]" if owner.get("online") else ""
-                                    self.log("CREATOR", "#00ff66", f"Created by: {owner['nick']} ({owner['short_id']}){on_tag} | Key: {owner['pubkey'][:16]}...")
+                                    self.log("AUTHOR", "#88ccff", f"{owner['nick']} (#{owner['short_id']}){on_tag}{upd_str}")
                                 else:
-                                    self.log("CREATOR", "#ffaa00", "Created by: (unclaimed)")
-                                self.log("DETAILS", "#88ccff", f"Spawn: ({sp_pos[0]:.1f}, {sp_pos[1]:.1f}, {sp_pos[2]:.1f}) | Co-builders: {len(cbs)} | Players here: {len(players)}" + (f" [{', '.join(p['nick'] for p in players)}]" if players else ""))
+                                    self.log("AUTHOR", "#ffaa00", f"Unclaimed{upd_str}")
+
+                                raw_sp = data.get("spawn_pos")
+                                sp_pos = raw_sp if (isinstance(raw_sp, list) and len(raw_sp) >= 3) else [0.0, 2.25, 13.5]
+                                sp_yaw = float(data.get("spawn_yaw", 0.0) or 0.0)
+                                sp_kind = "custom" if data.get("spawn_custom") else "default"
+                                n_objs = int(data.get("object_count", 0) or 0)
+                                n_ports = int(data.get("portal_count", 0) or 0)
+                                n_trigs = int(data.get("trigger_count", 0) or 0)
+                                kb_sz = max(1, (int(data.get("bytes", 0) or 0) + 512) // 1024)
+                                snaps_n = int(data.get("snapshots_count", 0) or 0)
+                                self.log(
+                                    "SCENE",
+                                    "#b8d8ff",
+                                    f"Spawn: ({float(sp_pos[0]):.1f}, {float(sp_pos[1]):.1f}, {float(sp_pos[2]):.1f}) yaw {sp_yaw:.0f} deg ({sp_kind})  |  "
+                                    f"{n_objs} objs, {n_ports} portals, {n_trigs} triggers ({kb_sz} KB, {snaps_n} backups)",
+                                )
+
+                                r_url = str(data.get("radio_url") or "").strip()
+                                r_name = str(data.get("radio_name") or "").strip()
+                                if r_url:
+                                    r_disp = f"{r_name} ({r_url})" if (r_name and r_name != r_url) else r_url
+                                    self.log("RADIO", "#ff99dd", r_disp)
+
+                                players = data.get("players", [])
+                                cbs = data.get("co_builders", [])
+                                p_str = ", ".join(f"{p['nick']} (#{p['short_id']})" for p in players) if players else "none"
+                                cb_str = f"  |  Co-builders: {', '.join(c['nick'] for c in cbs)}" if cbs else ""
+                                self.log("ONLINE", "#7dffb3", f"Players here ({len(players)}): {p_str}{cb_str}")
                             elif mtype == "world_desc_updated":
                                 w_nm = data.get("world", self.world)
                                 d_txt = data.get("description", "")
+                                has_tags = "tags" in data and isinstance(data.get("tags"), list)
+                                t_list = [str(t).strip() for t in (data.get("tags") or []) if isinstance(t, (str, int, float)) and not isinstance(t, bool) and str(t).strip()]
                                 r_url = str(data.get("radio_url", "") or "").strip()
                                 r_name = str(data.get("radio_name", "") or r_url).strip()
                                 if w_nm == self.world:
                                     self.world_desc = d_txt
                                     if "radio_url" in data:
                                         self.radio.set_stream(r_url, r_name)
-                                self.log("DESC", "#00ff66", f"[{w_nm}] {d_txt or '(description cleared)'}")
+                                if t_list:
+                                    tags_suffix = f" | Tags: {' '.join('#' + t for t in t_list)}"
+                                elif has_tags:
+                                    tags_suffix = " | Tags: (cleared)"
+                                else:
+                                    tags_suffix = ""
+                                self.log("META", "#00ff66", f"[{w_nm}] {d_txt or '(no description)'}{tags_suffix}")
                             elif mtype == "role_updated":
                                 self.role = str(data.get("role", "guest")).upper()
                                 self.log("PERMS", "#ff66cc", f"Your server role was updated to: {self.role}")
@@ -1582,6 +1644,7 @@ class MakerverseClient:
                                 self.log("SERVER", "#ffaa00", data.get("msg", ""))
                     finally:
                         self.active_ws = None
+                        self._connect_task = None
                         self.connected = False
                         send_task.cancel()
                         try:
@@ -1590,12 +1653,14 @@ class MakerverseClient:
                             pass
             except Exception as exc:
                 self.active_ws = None
+                self._connect_task = None
                 self.connected = False
                 if self.reconnect_target:
                     continue
                 if self.running:
-                    self.log("NET-ERR", "#ff4444", f"Reconnecting ({exc})...")
-                    await asyncio.sleep(3)
+                    detail = str(exc).strip() or type(exc).__name__
+                    self.log("NET-ERR", "#ff4444", f"Connection to {self.server_url} failed ({detail}); retrying...")
+                    await asyncio.sleep(2.5)
 
 
 def _target_placed_id(client: MakerverseClient, explicit_tok: str = "") -> str:
@@ -1612,7 +1677,7 @@ def handle_command(client: MakerverseClient, text: str):
     parts = text.strip().split(" ", 3)
     cmd = parts[0].lower()
     if cmd == "/help":
-        client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /desc [w] <txt|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
+        client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/place <shape> [col] [sc] | /moveobj | /rotateobj | /scaleobj | /paint | /cloneobj | /delobj | /undo | /snap [m] | /watch <world|avatar> <n> <file>")
         client.log("HELP", "#ff66cc", "/perms | /admin <u> | /grant <u> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /allowbuilder <u> | /allowvisitor <u>")
         client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n> | /key")
@@ -1656,6 +1721,30 @@ def handle_command(client: MakerverseClient, text: str):
         if desc_body.lower() in ("clear", "none"):
             desc_body = ""
         client.send_json({"type": "set_world_meta", "world": target_w, "description": desc_body})
+    elif cmd == "/tags":
+        if len(parts) < 2 or not parts[1].strip():
+            client.log("TAGS", "#00ffcc", f"Usage: /tags [world] <tag1, tag2, ... | clear> (search with /worlds <tag>)")
+            return
+        rest_str = text.strip().split(" ", 1)[1].strip()
+        sub2 = rest_str.split(" ", 1)
+        if len(sub2) == 2 and sub2[0] in client.worlds:
+            target_w, tags_body = sub2[0], sub2[1].strip()
+        else:
+            target_w, tags_body = client.world, rest_str
+        if tags_body.lower() in ("clear", "none"):
+            tag_list = []
+        else:
+            tag_list = []
+            for tok in re.split(r"[,\s]+", tags_body):
+                ct = _clean_ident(tok.lstrip("#"), 24, "").lower()
+                if ct and ct not in tag_list:
+                    tag_list.append(ct)
+                if len(tag_list) >= 8:
+                    break
+            if not tag_list:
+                client.log("ERR", "#ff4444", "Provide at least one valid tag (letters, numbers, '_' or '-') or 'clear'.")
+                return
+        client.send_json({"type": "set_world_meta", "world": target_w, "tags": tag_list})
     elif cmd == "/sky" and len(parts) > 1:
         c_hex = "".join(f"{max(0,min(255,int(round(v*255)))):02x}" for v in parse_color(parts[1]))
         client.send_json({"type": "set_world_meta", "world": client.world, "sky": f'"#{c_hex}"'})
@@ -1852,7 +1941,8 @@ def handle_command(client: MakerverseClient, text: str):
     elif cmd == "/createworld" and len(parts) > 1:
         wname = _clean_ident(parts[1], 32, "world")
         tpl = parts[2] if len(parts) > 2 else "flat"
-        desc = parts[3] if len(parts) > 3 else ""
+        raw_desc = parts[3].strip() if len(parts) > 3 else ""
+        desc = raw_desc[1:-1] if len(raw_desc) >= 2 and raw_desc[0] == raw_desc[-1] and raw_desc[0] in ('"', "'") else raw_desc
         md = build_template_mv3d_world(tpl, wname, desc)
         client.send_json({"type": "upload", "kind": "world", "name": wname, "content": md, "description": desc})
     elif cmd == "/prefabs":

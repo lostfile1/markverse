@@ -543,9 +543,57 @@ def summarize_world_ratings(w_entry: dict) -> tuple[float, int, dict[int, int]]:
     return (round(total / count, 2) if count else 0.0), count, dist
 
 
+def _effective_world_meta(target: str, raw_entry: dict | None, md_text: str = "") -> tuple[dict, dict, bool]:
+    w_entry = dict(raw_entry or {})
+    parsed_scene = parse_mv3d(md_text) if md_text else {}
+
+    title_raw = w_entry.get("title") or parsed_scene.get("title") or ("Neo-Genesis Grid" if target.lower() == "hub" else target)
+    w_entry["title"] = re.sub(r"[\x00-\x1f\x7f]", " ", str(title_raw)).strip()[:64] or target
+
+    if "description" in w_entry and w_entry["description"] is not None:
+        desc_raw = str(w_entry["description"])
+    else:
+        desc_raw = str(parsed_scene.get("world_info_desc", ""))
+    w_entry["description"] = re.sub(r"[\x00-\x1f\x7f]", " ", desc_raw).strip()[:240]
+
+    raw_tags = w_entry.get("tags") if "tags" in w_entry else parsed_scene.get("tags", [])
+    if isinstance(raw_tags, str):
+        raw_tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+    elif not isinstance(raw_tags, list):
+        raw_tags = []
+    w_entry["tags"] = [sanitize_name(str(t)) for t in raw_tags[:8] if sanitize_name(str(t))]
+
+    if "radio_url" in w_entry and w_entry["radio_url"] is not None:
+        r_url = str(w_entry["radio_url"]).strip()
+        r_name = str(w_entry.get("radio_name") or r_url).strip()
+    else:
+        r_url = str(parsed_scene.get("radio_url", "")).strip()
+        r_name = str(parsed_scene.get("radio_name") or r_url).strip()
+    w_entry["radio_url"] = re.sub(r"[\x00-\x1f\x7f]", "", r_url)[:300]
+    w_entry["radio_name"] = re.sub(r"[\x00-\x1f\x7f]", " ", r_name).strip()[:64] if w_entry["radio_url"] else ""
+
+    if isinstance(w_entry.get("spawn_pos"), list) and len(w_entry["spawn_pos"]) >= 3 and all(_is_finite_num(v) for v in w_entry["spawn_pos"][:3]):
+        sp_pos, sp_yaw = get_world_spawn(target, w_entry)
+        spawn_custom = True
+    elif isinstance(parsed_scene.get("spawn_pos"), list) and len(parsed_scene["spawn_pos"]) >= 3:
+        sp_pos = [float(parsed_scene["spawn_pos"][0]), float(parsed_scene["spawn_pos"][1]), float(parsed_scene["spawn_pos"][2])]
+        sp_yaw = float(parsed_scene.get("spawn_yaw", 0.0) or 0.0)
+        w_entry["spawn_pos"] = sp_pos
+        w_entry["spawn_yaw"] = sp_yaw
+        spawn_custom = True
+    else:
+        sp_pos, sp_yaw = get_world_spawn(target, w_entry)
+        spawn_custom = False
+
+    return w_entry, parsed_scene, spawn_custom
+
+
 def build_world_info_payload(target: str, meta: dict, perms: dict) -> dict:
     md_path = _safe_child_path(WORLDS_DIR, f"{target}.md")
-    w_entry = meta.get(target, {})
+    md_text = read_md_safe(md_path) if (md_path and md_path.exists()) else ""
+    w_entry, parsed_scene, spawn_custom = _effective_world_meta(target, meta.get(target, {}), md_text)
+    sp_pos, sp_yaw = get_world_spawn(target, w_entry)
+
     owner_key = str(w_entry.get("owner", "")).strip()
     nick_reg = perms.get("nick_registry", {})
     online_by_key = {st["pubkey"]: st for st in CLIENTS.values()}
@@ -559,30 +607,36 @@ def build_world_info_payload(target: str, meta: dict, perms: dict) -> dict:
             "online": bool(on_st),
         }
 
-    sp_pos, sp_yaw = get_world_spawn(target, w_entry)
+    file_mtime = int(md_path.stat().st_mtime) if (md_path and md_path.exists()) else 0
+    created_ts = int(w_entry.get("created_at", 0) or 0) or file_mtime
+    updated_ts = int(w_entry.get("updated_at", 0) or 0) or file_mtime
+
     avg_rat, cnt_rat, _ = summarize_world_ratings(w_entry)
     return {
         "type": "world_info",
         "avg_rating": avg_rat,
         "rating_count": cnt_rat,
         "world": target,
-        "title": w_entry.get("title") or ("Neo-Genesis Grid" if target.lower() == "hub" else target),
-        "description": w_entry.get("description", ""),
-        "tags": w_entry.get("tags", []),
+        "title": w_entry["title"],
+        "description": w_entry["description"],
+        "tags": w_entry["tags"],
         "private": bool(w_entry.get("private", False)),
         "is_system": target.lower() == "hub" and not owner_key,
         "owner": _resolve_member(owner_key, w_entry.get("owner_nick", "")) if owner_key else None,
         "co_builders": [_resolve_member(k) for k in w_entry.get("co_builders", [])],
         "whitelist": [_resolve_member(k) for k in w_entry.get("whitelist", [])],
-        "radio_url": w_entry.get("radio_url", ""),
-        "radio_name": w_entry.get("radio_name", ""),
+        "radio_url": w_entry["radio_url"],
+        "radio_name": w_entry["radio_name"],
         "spawn_pos": sp_pos,
         "spawn_yaw": sp_yaw,
-        "spawn_custom": bool(w_entry.get("spawn_pos")),
-        "created_at": int(w_entry.get("created_at", 0) or 0),
-        "updated_at": int(w_entry.get("updated_at", 0) or 0),
+        "spawn_custom": spawn_custom,
+        "created_at": created_ts,
+        "updated_at": updated_ts,
         "bytes": md_path.stat().st_size if (md_path and md_path.exists()) else 0,
-        "sha256": compute_md_sha256(read_md_safe(md_path)) if (md_path and md_path.exists()) else "",
+        "sha256": compute_md_sha256(md_text) if md_text else "",
+        "object_count": len(parsed_scene.get("objects", [])),
+        "portal_count": len(parsed_scene.get("portals", [])),
+        "trigger_count": len(parsed_scene.get("triggers", [])),
         "players": [
             {"nick": st["nick"], "short_id": st["short_id"], "role": st["role"]}
             for st in CLIENTS.values()
@@ -618,6 +672,8 @@ async def send_world_transition(
     md_path = _safe_child_path(WORLDS_DIR, f"{target}.md")
     if md_path is None or not md_path.exists():
         return
+    md_text = read_md_safe(md_path)
+    w_meta, _, _ = _effective_world_meta(target, w_meta, md_text)
     sp_pos, sp_yaw = get_world_spawn(target, w_meta)
     if spawn_override is not None:
         sp_pos = list(spawn_override)
@@ -627,7 +683,6 @@ async def send_world_transition(
     client_state["pos"] = list(sp_pos)
     client_state["rot"] = [0.0, 1.0, 0.0, round(math.radians(-sp_yaw), 3)]
 
-    md_text = read_md_safe(md_path)
     md_hash = compute_md_sha256(md_text)
     msg = {
         "type": "world_cached" if (client_hash and client_hash == md_hash) else "world_data",
@@ -812,7 +867,8 @@ async def handler(websocket):
                 if req_avatar != "default" and (av_cand is None or not av_cand.exists()):
                     req_avatar = "default"
 
-                w_meta = meta.get(world, {})
+                md_text = read_md_safe(WORLDS_DIR / f"{world}.md")
+                w_meta, _, _ = _effective_world_meta(world, meta.get(world, {}), md_text)
                 sp_pos, sp_yaw = get_world_spawn(world, w_meta)
                 ov_sp, ov_yaw = _sanitize_spawn_override(data.get("spawn_pos"), data.get("spawn_yaw"))
                 if ov_sp is not None:
@@ -835,7 +891,6 @@ async def handler(websocket):
                 worlds_list = [f.stem for f in WORLDS_DIR.glob("*.md") if can_visit_world(f.stem, meta.get(f.stem, {}), pubkey_hex, role)]
                 avatars_list = sorted(f.stem for f in AVATARS_DIR.glob("*.md"))
                 fed = load_federation()
-                md_text = read_md_safe(WORLDS_DIR / f"{world}.md")
                 print(f"[AUTH] {nick} ({role}) -> '{world}' [avatar: {req_avatar}] ({len(md_text)} bytes)")
 
                 auth_payload = {
@@ -1650,6 +1705,27 @@ async def handler(websocket):
                     if "title" in data and str(data["title"]).strip():
                         w_entry["title"] = re.sub(r'[\x00-\x1f\x7f"]', " ", str(data["title"])).strip()[:64]
                         fm_updates["title"] = f'"{w_entry["title"]}"'
+                    if "tags" in data and data["tags"] is not None:
+                        raw_tags_in = data["tags"]
+                        if isinstance(raw_tags_in, str):
+                            raw_items = [t.lstrip("#").strip() for t in re.split(r"[,\s]+", raw_tags_in) if t.strip()]
+                        elif isinstance(raw_tags_in, list):
+                            raw_items = [
+                                str(t).lstrip("#").strip()
+                                for t in raw_tags_in[:32]
+                                if isinstance(t, (str, int, float)) and not isinstance(t, bool) and str(t).strip()
+                            ]
+                        else:
+                            raw_items = []
+                        clean_tags = []
+                        for t_item in raw_items:
+                            st = sanitize_name(t_item).lower()[:24]
+                            if st and st != "unnamed" and st not in clean_tags:
+                                clean_tags.append(st)
+                            if len(clean_tags) >= 8:
+                                break
+                        w_entry["tags"] = clean_tags
+                        fm_updates["tags"] = f"[{', '.join(clean_tags)}]" if clean_tags else None
                     if "sky" in data and str(data["sky"]).strip():
                         sky_raw = re.sub(r'[\x00-\x1f\x7f"]', "", str(data["sky"])).strip()[:120]
                         fm_updates["sky"] = sky_raw
@@ -1679,6 +1755,7 @@ async def handler(websocket):
                     "world": target,
                     "title": w_entry.get("title", target),
                     "description": w_entry.get("description", ""),
+                    "tags": w_entry.get("tags", []),
                     "radio_url": w_entry.get("radio_url", ""),
                     "radio_name": w_entry.get("radio_name", ""),
                 }
