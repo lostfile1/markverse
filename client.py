@@ -1473,13 +1473,15 @@ class MakerverseClient:
                                     self.world_desc = d_txt
                                     if "radio_url" in data:
                                         self.radio.set_stream(r_url, r_name)
+                                t_title = " ".join(str(data.get("title") or "").split()).strip()[:64]
+                                title_prefix = f'"{t_title}" - ' if (t_title and t_title.lower() != str(w_nm).lower()) else ""
                                 if t_list:
                                     tags_suffix = f" | Tags: {' '.join('#' + t for t in t_list)}"
                                 elif has_tags:
                                     tags_suffix = " | Tags: (cleared)"
                                 else:
                                     tags_suffix = ""
-                                self.log("META", "#00ff66", f"[{w_nm}] {d_txt or '(no description)'}{tags_suffix}")
+                                self.log("META", "#00ff66", f"[{w_nm}] {title_prefix}{d_txt or '(no description)'}{tags_suffix}")
                             elif mtype == "role_updated":
                                 self.role = str(data.get("role", "guest")).upper()
                                 self.log("PERMS", "#ff66cc", f"Your server role was updated to: {self.role}")
@@ -1677,7 +1679,7 @@ def handle_command(client: MakerverseClient, text: str):
     parts = text.strip().split(" ", 3)
     cmd = parts[0].lower()
     if cmd == "/help":
-        client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
+        client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/place <shape> [col] [sc] | /moveobj | /rotateobj | /scaleobj | /paint | /cloneobj | /delobj | /undo | /snap [m] | /watch <world|avatar> <n> <file>")
         client.log("HELP", "#ff66cc", "/perms | /admin <u> | /grant <u> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /allowbuilder <u> | /allowvisitor <u>")
         client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n> | /key")
@@ -1708,6 +1710,22 @@ def handle_command(client: MakerverseClient, text: str):
     elif cmd == "/worldinfo":
         target_w = parts[1].strip() if len(parts) > 1 and parts[1].strip() else client.world
         client.send_json({"type": "get_world_info", "world": target_w})
+    elif cmd == "/title":
+        if len(parts) < 2 or not parts[1].strip():
+            client.log("TITLE", "#00ffcc", "Usage: /title [world] <new title | clear>")
+            return
+        rest_str = text.strip().split(" ", 1)[1].strip()
+        sub2 = rest_str.split(" ", 1)
+        if len(sub2) == 2 and sub2[0] in client.worlds and sub2[1].strip():
+            target_w, title_body = sub2[0], sub2[1].strip()
+        else:
+            target_w, title_body = client.world, rest_str
+        if title_body.lower() in ("clear", "none"):
+            title_body = ""
+        elif len(title_body) >= 2 and title_body[0] == title_body[-1] and title_body[0] in ('"', "'"):
+            title_body = title_body[1:-1].strip()
+        title_body = " ".join(title_body.split())[:64]
+        client.send_json({"type": "set_world_meta", "world": target_w, "title": title_body})
     elif cmd == "/desc":
         if len(parts) < 2 or not parts[1].strip():
             client.log("DESC", "#00ffcc", f"'{client.world}': {client.world_desc or '(none set)'} (usage: /desc [world] <description|clear>)")

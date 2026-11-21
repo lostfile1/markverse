@@ -1702,9 +1702,12 @@ async def handler(websocket):
                     if "description" in data and data["description"] is not None:
                         w_entry["description"] = re.sub(r'[\x00-\x1f\x7f"]', " ", str(data["description"])).strip()[:240]
                         fm_updates["description"] = f'"{w_entry["description"]}"'
-                    if "title" in data and str(data["title"]).strip():
-                        w_entry["title"] = re.sub(r'[\x00-\x1f\x7f"]', " ", str(data["title"])).strip()[:64]
-                        fm_updates["title"] = f'"{w_entry["title"]}"'
+                    if "title" in data and data["title"] is not None:
+                        raw_t = re.sub(r"[\x00-\x1f\x7f]", " ", str(data["title"]))
+                        clean_t = " ".join(raw_t.split()).strip()[:64]
+                        w_entry["title"] = clean_t
+                        escaped_t = clean_t.replace("\\", "\\\\").replace('"', '\\"')
+                        fm_updates["title"] = f'"{escaped_t}"' if clean_t else None
                     if "tags" in data and data["tags"] is not None:
                         raw_tags_in = data["tags"]
                         if isinstance(raw_tags_in, str):
