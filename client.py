@@ -24,9 +24,11 @@ import websockets
 from nacl.signing import SigningKey
 
 from mv3d import (
+    PLACED_SHAPES,
     WORLD_TEMPLATES,
     _axis_angle_to_quat,
     _quat_rotate_vec,
+    build_ghost_preview_objects,
     build_template_mv3d_world,
     compute_md_sha256,
     normalize_expression_name,
@@ -1019,6 +1021,12 @@ class MakerverseClient:
         self.fly_mode = False
         self.inspect_mode = False
         self.grid_snap = 0.0
+        self.ghost_active = False
+        self.ghost_shape = "box"
+        self.ghost_color = "cyan"
+        self.ghost_scale = 1.0
+        self.ghost_dist = 4.5
+        self.ghost_yaw_offset = 0.0
         self.watch_spec = None  # {"kind": "world"|"avatar", "name": str, "path": Path, "mtime": float, "sha256": str, "last_poll": float}
         self.looked_at_hit = None
         self.camera_mode = "first"
@@ -1062,6 +1070,47 @@ class MakerverseClient:
         if snap and self.grid_snap > 0.0:
             yaw_p = round((round(yaw_p / 45.0) * 45.0) % 360.0, 1)
         return px, py, pz, yaw_p
+
+    def _compute_ghost_placement(self) -> tuple[float, float, float, float]:
+        dist = max(2.0, min(25.0, float(self.ghost_dist)))
+        px, py, pz, base_yaw = self._front_placement_pos(dist=dist, snap=True)
+        yaw_p = round((base_yaw + float(self.ghost_yaw_offset)) % 360.0, 1)
+        if self.grid_snap > 0.0:
+            yaw_p = round((round(yaw_p / 45.0) * 45.0) % 360.0, 1)
+        return px, py, pz, yaw_p
+
+    def _ghost_aabb(self, ghost_objs: list[dict]) -> tuple[float, float, float, float, float, float] | None:
+        boxes = [b for b in (get_object_aabb(o) for o in ghost_objs) if b is not None]
+        if not boxes:
+            return None
+        return (
+            min(b[0] for b in boxes), max(b[1] for b in boxes),
+            min(b[2] for b in boxes), max(b[3] for b in boxes),
+            min(b[4] for b in boxes), max(b[5] for b in boxes),
+        )
+
+    def commit_ghost_placement(self):
+        if not self.ghost_active:
+            return
+        if not self.connected:
+            self.log("NET", "#ffaa00", "Not connected to server yet; ghost placement skipped.")
+            return
+        if self.role not in ("ADMIN", "BUILDER"):
+            self.log("ERR", "#ff4444", "Builder or admin role required to place objects.")
+            return
+        px, py, pz, yaw_p = self._compute_ghost_placement()
+        self.send_json({
+            "type": "world_edit",
+            "action": "place",
+            "world": self.world,
+            "shape": self.ghost_shape,
+            "x": px,
+            "y": py,
+            "z": pz,
+            "scale": self.ghost_scale,
+            "color": self.ghost_color,
+            "yaw": yaw_p,
+        })
 
     def log(self, sender: str, color: str, text: str):
         self.chat_log.append((sender, color, re.sub(r"[\x00-\x1f\x7f]", " ", str(text))))
@@ -1266,6 +1315,7 @@ class MakerverseClient:
         if not norm_url:
             self.log("ERR", "#ff4444", "Invalid WebSocket URL (expected ws:// or wss://host[:port]).")
             return
+        self.ghost_active = False
         self.peers.clear()
         self.radio.stop()
         self._drain_out_queue()
@@ -1753,7 +1803,7 @@ def handle_command(client: MakerverseClient, text: str):
     cmd = parts[0].lower()
     if cmd == "/help":
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
-        client.log("HELP", "#ff66cc", "/place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] [@x,y,z] | /moveobj | /scaleobj | /paint | /delobj | /undo | /snap [m]")
+        client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /paint | /delobj | /undo | /snap [m]")
         client.log("HELP", "#ff66cc", "/perms | /admin <u> | /grant <u> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /allowbuilder <u> | /allowvisitor <u>")
         client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n> | /key")
     elif cmd == "/rate":
@@ -2128,15 +2178,53 @@ def handle_command(client: MakerverseClient, text: str):
             client.log("WATCH", "#ffaa00", f"Stopped watching {fn_w}.")
         else:
             client.log("WATCH", "#ffaa00", "No active file watch.")
+    elif cmd in ("/ghost", "/preview"):
+        raw_g = text.strip().split()[1:]
+        if not raw_g:
+            client.ghost_active = not client.ghost_active
+            if client.ghost_active:
+                client.log("GHOST", "#00ff66", f"3D Ghost Preview ON: {client.ghost_shape} ({client.ghost_color}, {client.ghost_scale:.2f}x). [LMB/Enter] Place | [Scroll] Dist | [[/]] Scale | [R] Rot | [B] Cycle | [Esc/X] Cancel")
+            else:
+                client.log("GHOST", "#ffaa00", "3D Ghost Preview OFF.")
+            return
+        tok0 = raw_g[0].strip().lower()
+        if tok0 in ("off", "stop", "cancel", "none", "0"):
+            client.ghost_active = False
+            client.log("GHOST", "#ffaa00", "3D Ghost Preview OFF.")
+            return
+        if tok0 not in ("on", "start", "1"):
+            if tok0 not in PLACED_SHAPES:
+                client.log("ERR", "#ff4444", f"Unknown shape '{tok0}'. Valid: {', '.join(PLACED_SHAPES)}")
+                return
+            client.ghost_shape = tok0
+        if len(raw_g) >= 2 and raw_g[1].strip():
+            client.ghost_color = raw_g[1].strip()[:24]
+        if len(raw_g) >= 3 and raw_g[2].strip():
+            try:
+                sc_v = float(raw_g[2].strip())
+                if math.isfinite(sc_v):
+                    client.ghost_scale = max(0.2, min(20.0, round(sc_v, 2)))
+            except ValueError:
+                client.log("ERR", "#ff4444", "Ghost scale must be a number (0.2 to 20.0).")
+                return
+        client.ghost_active = True
+        client.log("GHOST", "#00ff66", f"3D Ghost Preview ON: {client.ghost_shape} ({client.ghost_color}, {client.ghost_scale:.2f}x). [LMB] Place | [Scroll] Dist | [[/]] Scale | [R] Rot | [B] Shape")
     elif cmd == "/place":
-        shape = parts[1].lower() if len(parts) > 1 else "box"
-        color = parts[2] if len(parts) > 2 else "cyan"
+        shape = parts[1].lower() if len(parts) > 1 and parts[1].strip() else (client.ghost_shape if client.ghost_active else "box")
+        if shape not in PLACED_SHAPES:
+            client.log("ERR", "#ff4444", f"Invalid shape '{shape}'. Valid: {', '.join(PLACED_SHAPES)}")
+            return
+        color = parts[2].strip() if len(parts) > 2 and parts[2].strip() else (client.ghost_color if client.ghost_active else "cyan")
         try:
-            scale = float(parts[3]) if len(parts) > 3 else 1.0
+            scale = float(parts[3]) if len(parts) > 3 and parts[3].strip() else (client.ghost_scale if client.ghost_active else 1.0)
             scale = max(0.2, min(20.0, scale if math.isfinite(scale) else 1.0))
         except ValueError:
             scale = 1.0
-        px, py, pz, yaw_p = client._front_placement_pos(dist=4.5, snap=True)
+        if client.ghost_active:
+            client.ghost_shape, client.ghost_color, client.ghost_scale = shape, color, round(scale, 2)
+            px, py, pz, yaw_p = client._compute_ghost_placement()
+        else:
+            px, py, pz, yaw_p = client._front_placement_pos(dist=4.5, snap=True)
         client.send_json({
             "type": "world_edit", "action": "place", "world": client.world,
             "shape": shape, "x": px, "y": py, "z": pz,
@@ -2731,9 +2819,31 @@ def main():
                                 chat_buffer += event.unicode
                     else:
                         if event.key == K_ESCAPE:
-                            mouse_grabbed = not mouse_grabbed
-                            pygame.event.set_grab(mouse_grabbed)
-                            pygame.mouse.set_visible(not mouse_grabbed)
+                            if client.ghost_active:
+                                client.ghost_active = False
+                                client.log("GHOST", "#ffaa00", "3D Ghost Preview cancelled.")
+                            else:
+                                mouse_grabbed = not mouse_grabbed
+                                pygame.event.set_grab(mouse_grabbed)
+                                pygame.mouse.set_visible(not mouse_grabbed)
+                        elif event.key == K_b:
+                            if not client.ghost_active:
+                                client.ghost_active = True
+                                client.log("GHOST", "#00ff66", f"3D Ghost Preview ON: {client.ghost_shape} ({client.ghost_color}, {client.ghost_scale:.2f}x). [LMB] Place | [Scroll] Dist | [[/]] Scale | [R] Rot | [B] Next | [Esc] Off")
+                            else:
+                                nxt_idx = (PLACED_SHAPES.index(client.ghost_shape) + 1) % len(PLACED_SHAPES) if client.ghost_shape in PLACED_SHAPES else 0
+                                client.ghost_shape = PLACED_SHAPES[nxt_idx]
+                        elif event.key == K_x and client.ghost_active:
+                            client.ghost_active = False
+                            client.log("GHOST", "#ffaa00", "3D Ghost Preview OFF.")
+                        elif event.key == K_LEFTBRACKET and client.ghost_active:
+                            client.ghost_scale = max(0.2, round(client.ghost_scale - 0.25, 2))
+                        elif event.key == K_RIGHTBRACKET and client.ghost_active:
+                            client.ghost_scale = min(20.0, round(client.ghost_scale + 0.25, 2))
+                        elif event.key == K_MINUS and client.ghost_active:
+                            client.ghost_dist = max(2.0, round(client.ghost_dist - 0.5, 2))
+                        elif event.key == K_EQUALS and client.ghost_active:
+                            client.ghost_dist = min(25.0, round(client.ghost_dist + 0.5, 2))
                         elif event.key == K_i:
                             client.inspect_mode = not client.inspect_mode
                         elif event.key == K_v:
@@ -2746,10 +2856,13 @@ def main():
                         elif event.key == K_g:
                             client.grid_snap = 0.0 if client.grid_snap > 0.0 else 0.5
                             client.log("BUILD", "#00ff66", f"Grid snap: {client.grid_snap}m" if client.grid_snap > 0.0 else "Grid snap: OFF")
-                        elif event.key == K_r and client.inspect_mode:
-                            tid_r = _target_placed_id(client)
-                            if tid_r:
-                                client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "rotate", "tag_id": tid_r, "yaw_delta": 45.0})
+                        elif event.key == K_r:
+                            if client.ghost_active:
+                                client.ghost_yaw_offset = round((client.ghost_yaw_offset + 45.0) % 360.0, 1)
+                            elif client.inspect_mode:
+                                tid_r = _target_placed_id(client)
+                                if tid_r:
+                                    client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "rotate", "tag_id": tid_r, "yaw_delta": 45.0})
                         elif event.key in (K_1, K_2, K_3, K_4):
                             em_n = {K_1: "wave", K_2: "dance", K_3: "spin", K_4: "jump"}[event.key]
                             client.local_emote = em_n
@@ -2759,6 +2872,14 @@ def main():
                             chat_mode = True
                             chat_buffer = "/" if event.key == K_SLASH else ""
                             pygame.event.set_grab(False); pygame.mouse.set_visible(True)
+                elif event.type == MOUSEBUTTONDOWN and not chat_mode and mouse_grabbed:
+                    if event.button == 1 and client.ghost_active:
+                        client.commit_ghost_placement()
+                elif event.type == MOUSEWHEEL and not chat_mode:
+                    if client.ghost_active:
+                        client.ghost_dist = max(2.0, min(25.0, round(client.ghost_dist + event.y * 0.5, 2)))
+                    elif client.camera_mode != "first":
+                        client.cam_dist = max(2.0, min(14.0, round(client.cam_dist - event.y * 0.5, 2)))
                 elif event.type == MOUSEMOTION and mouse_grabbed and not chat_mode:
                     dx, dy = event.rel
                     yaw -= dx * 0.18
@@ -2863,13 +2984,34 @@ def main():
             for peer in render_list:
                 render_peer_modern(renderer, peer, vp_mat, client.avatar_meshes, now)
 
+            if client.ghost_active:
+                gx, gy, gz, gyaw = client._compute_ghost_placement()
+                pulse_a = 0.34 + 0.12 * math.sin(now * 5.0)
+                ghost_objs = build_ghost_preview_objects(
+                    client.ghost_shape,
+                    gx,
+                    gy,
+                    gz,
+                    client.ghost_scale,
+                    parse_color(client.ghost_color),
+                    yaw_deg=gyaw,
+                    alpha=pulse_a,
+                )
+                glDepthMask(GL_FALSE)
+                for g_obj in ghost_objs:
+                    renderer.draw_object(g_obj, vp_mat)
+                glDepthMask(GL_TRUE)
+                g_box = client._ghost_aabb(ghost_objs)
+                if g_box is not None:
+                    renderer.draw_wire_aabb(g_box, vp_mat)
+
             if not client.hud_hidden:
                 glDisable(GL_DEPTH_TEST)
                 glUseProgram(renderer.prog2d)
                 glUniformMatrix4fv(glGetUniformLocation(renderer.prog2d, "uOrtho"), 1, GL_TRUE, ortho_mat)
 
                 renderer.draw_rect_2d(0, 0, WINDOW_W, 38, (0.04, 0.03, 0.10, 0.85))
-                flags = f"{' [FLY]' if client.fly_mode else ''}{' [INSPECT]' if client.inspect_mode else ''}{f' [SNAP:{client.grid_snap}m]' if client.grid_snap > 0.0 else ''}{' [WATCH]' if client.watch_spec else ''}{' [MUTE]' if client.radio.muted else ''}"
+                flags = f"{' [GHOST]' if client.ghost_active else ''}{' [FLY]' if client.fly_mode else ''}{' [INSPECT]' if client.inspect_mode else ''}{f' [SNAP:{client.grid_snap}m]' if client.grid_snap > 0.0 else ''}{' [WATCH]' if client.watch_spec else ''}{' [MUTE]' if client.radio.muted else ''}"
                 renderer.draw_text_2d(font, 14, 10, f"MAKERVERSE // mv3d://{client.node_name}/{client.world}.md  |  {client.nick} [{client.role}]{flags}  |  {int(clock.get_fps())} FPS", (0, 255, 204))
 
                 # 3D Sign Billboards
@@ -2944,7 +3086,7 @@ def main():
                         disp_buf = disp_buf[1:]
                     prompt = f"> {disp_buf}_"
                 else:
-                    prompt = "[T] Chat | [1-4] Emote | [I] Inspect | [V] Cam | /help"
+                    prompt = "[LMB] Place | [B] Shape | [Scroll] Dist | [[/]] Scale | [R] Rot | [Esc] Off" if client.ghost_active else "[T] Chat | [B] Ghost | [I] Inspect | [V] Cam | /help"
                     while font.size(prompt)[0] > in_w - 12 and len(prompt) > 8:
                         prompt = prompt[:-4] + "..."
                 renderer.draw_text_2d(font, in_x + 6, in_y + 5, prompt, (255, 255, 255) if chat_mode else (140, 185, 175))
@@ -2955,6 +3097,14 @@ def main():
                 renderer.draw_rect_2d(cx + 3, cy - 1, 7, 2, ret_col)
                 renderer.draw_rect_2d(cx - 1, cy - 10, 2, 7, ret_col)
                 renderer.draw_rect_2d(cx - 1, cy + 3, 2, 7, ret_col)
+
+                if client.ghost_active:
+                    gx_h, gy_h, gz_h, gyaw_h = client._compute_ghost_placement()
+                    g_iy = 120 if client.inspect_mode else 50
+                    g_ix, g_iw, g_ih = WINDOW_W - 432, 420, 62
+                    renderer.draw_rect_2d(g_ix, g_iy, g_iw, g_ih, (0.02, 0.07, 0.11, 0.90))
+                    renderer.draw_text_2d(font, g_ix + 10, g_iy + 8, f"GHOST [B]: {client.ghost_shape.upper()} | {client.ghost_color} | {client.ghost_scale:.2f}x | {client.ghost_dist:.1f}m", (0, 255, 215))
+                    renderer.draw_text_2d(font, g_ix + 10, g_iy + 32, f"XYZ ({gx_h:.1f}, {gy_h:.1f}, {gz_h:.1f}) yaw {gyaw_h:.0f} deg - [LMB] Place | [Esc] Cancel", (175, 245, 220))
 
                 if client.inspect_mode:
                     ix, iy, iw, ih = WINDOW_W - 432, 50, 420, 62

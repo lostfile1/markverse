@@ -1,10 +1,7 @@
 import hashlib
-import ipaddress
 import math
 import re
 import secrets
-import socket
-import urllib.parse
 
 MAX_SCENE_OBJECTS = 4096
 MAX_NESTING_DEPTH = 12
@@ -250,6 +247,9 @@ def _rot_list_to_quat(rot_val):
     return (0.0, 0.0, 0.0, 1.0)
 
 
+import ipaddress
+import socket
+import urllib.parse
 
 
 def is_safe_media_url(url: str, allow_unresolvable: bool = False) -> tuple[bool, str]:
@@ -373,6 +373,7 @@ def parse_mv3d(md_text: str) -> dict:
         "objects": [],
         "portals": [],
         "triggers": [],
+        "media_screens": [],
         "has_floor": False,
         "raw_len": len(md_text or ""),
         "raw_preview": "",
@@ -713,23 +714,6 @@ def parse_mv3d(md_text: str) -> dict:
                         "rel_scale": (r_scale[0] * tmpl["rel_scale"][0], r_scale[1] * tmpl["rel_scale"][1], r_scale[2] * tmpl["rel_scale"][2]),
                     })
                 else:
-                    if isinstance(inst.get("media"), dict):
-                        z_nudge_u = _quat_rotate_vec(comp_q, (0.0, 0.0, 0.06))
-                        nudge_pos = (
-                            inst["pos"][0] + z_nudge_u[0],
-                            inst["pos"][1] + z_nudge_u[1],
-                            inst["pos"][2] + z_nudge_u[2],
-                        )
-                        inst["pos"] = nudge_pos
-                        ms_inst = {
-                            **inst["media"],
-                            "pos": nudge_pos,
-                            "rot": inst["rot"],
-                            "scale": inst["scale"],
-                            "width": inst["media"]["width"] * inst["scale"][0],
-                            "height": inst["media"]["height"] * inst["scale"][1],
-                        }
-                        inst["media"] = ms_inst
                     scene["objects"].append(inst)
         elif prop in ("media", "screen", "embed") and isinstance(val, dict):
             raw_u = str(val.get("url", "") or val.get("src", "")).strip()
@@ -746,6 +730,7 @@ def parse_mv3d(md_text: str) -> dict:
             if m_face not in ("front", "back", "left", "right", "both"):
                 m_face = "front"
             media_spec = {
+                "id": cur["def_name"] or f"media_{len(scene['media_screens'])}",
                 "url": raw_u[:500],
                 "embed_url": safe_u[:500],
                 "media_type": m_type,
@@ -758,10 +743,11 @@ def parse_mv3d(md_text: str) -> dict:
                 "rot": _quat_to_axis_angle_deg(cur["quat"]),
                 "scale": cur["scale"],
             }
+            scene["media_screens"].append(media_spec)
             z_nudge = _quat_rotate_vec(cur["quat"], (0.0, 0.0, 0.06))
             screen_pos = (cur["pos"][0] + z_nudge[0], cur["pos"][1] + z_nudge[1], cur["pos"][2] + z_nudge[2])
             media_spec["pos"] = screen_pos
-            media_obj = {
+            scene["objects"].append({
                 "kind": "box",
                 "node_name": cur["name"],
                 "pos": screen_pos,
@@ -773,26 +759,7 @@ def parse_mv3d(md_text: str) -> dict:
                 "alpha": 0.94,
                 "def_name": cur["def_name"],
                 "media": media_spec,
-            }
-            def_anc_m = next((n for n in reversed(stack) if n["is_def"]), None)
-            if def_anc_m is not None:
-                if cur is def_anc_m:
-                    r_pos, r_quat, r_scale = cur["local_pos"], cur["local_quat"], cur["local_scale"]
-                else:
-                    r_pos, r_quat, r_scale = _relative_to_ancestor(cur, def_anc_m)
-                    r_pos = (
-                        def_anc_m["local_pos"][0] + r_pos[0],
-                        def_anc_m["local_pos"][1] + r_pos[1],
-                        def_anc_m["local_pos"][2] + r_pos[2],
-                    )
-                def_anc_m["records"].append({
-                    **media_obj,
-                    "rel_pos": r_pos,
-                    "rel_quat": r_quat,
-                    "rel_scale": r_scale,
-                })
-            else:
-                scene["objects"].append(media_obj)
+            })
         elif prop in ("box", "sphere", "cylinder", "cone", "grid", "mesh", "sign") and isinstance(val, dict):
             diff = parse_color(val.get("color", "#73a6d9"))
             emis = parse_color(val.get("glow", "#000000"), default=(0.0, 0.0, 0.0))
@@ -907,6 +874,7 @@ def validate_mv3d_document(content: str, kind: str = "world") -> tuple[bool, str
     if kind == "avatar" and len(objs) > 128:
         return False, f"Avatar has {len(objs)} primitives (max 128 allowed).", warnings
 
+    for ms in parsed.get("media_screens", []):
         u_chk = ms.get("url", "")
         if u_chk:
             ok_u, err_u = is_safe_media_url(u_chk, allow_unresolvable=True)
@@ -1236,11 +1204,6 @@ def build_default_hub_md() -> str:
         "# Node: NexusSign",
         "* **pos**: [0, 3.6, -5.5]",
         '* **sign**: { text: "MAKERVERSE NEXUS", color: "#00ffd9", glow: "#006655" }',
-        "",
-        "# Node: WelcomeScreen",
-        "* **pos**: [9.5, 2.35, -7.5]",
-        "* **rot**: [0, -32, 0]",
-        '* **media**: { url: "https://example.org", type: "web", width: 4.2, height: 2.36, title: "NEXUS WEB MONITOR", glow: "#00b8ff", interactive: true }',
     ])
     return "\n".join(lines) + "\n"
 
@@ -1424,3 +1387,142 @@ def build_placed_media_snippet(
         f"* **scale**: [1.0, 1.0, 1.0]\n"
         f'* **media**: {{ url: "{safe_url}", type: "{m_type}", width: {w_val}, height: {h_val}, title: "{clean_title}", glow: "{glow_hex}", interactive: true }}'
     )
+
+
+PLACED_SHAPES = ("box", "pillar", "sphere", "cone", "arch", "platform", "wall")
+
+
+def build_ghost_preview_objects(
+    shape: str,
+    x: float,
+    y: float,
+    z: float,
+    scale: float,
+    rgb: tuple[float, float, float],
+    yaw_deg: float = 0.0,
+    alpha: float = 0.42,
+) -> list[dict]:
+    """Builds lightweight preview primitive dicts matching `build_placed_mv3d_snippet` geometry."""
+    sh = str(shape or "box").strip().lower()
+    if sh not in PLACED_SHAPES:
+        sh = "box"
+    s = max(0.2, min(20.0, _finite_float(scale, 1.0, 0.2, 20.0)))
+    px = _finite_float(x, 0.0, -500.0, 500.0)
+    py = _finite_float(y, 0.0, -100.0, 500.0)
+    pz = _finite_float(z, 0.0, -500.0, 500.0)
+    yaw = round(_finite_float(yaw_deg, 0.0) % 360.0, 1)
+    a_val = max(0.15, min(0.85, _finite_float(alpha, 0.42, 0.15, 0.85)))
+    diff = (
+        max(0.0, min(1.0, float(rgb[0]))),
+        max(0.0, min(1.0, float(rgb[1]))),
+        max(0.0, min(1.0, float(rgb[2]))),
+    )
+    emis = (diff[0] * 0.55, diff[1] * 0.55, diff[2] * 0.55)
+
+    if sh == "arch":
+        yr = math.radians(yaw)
+        cos_y, sin_y = math.cos(yr), math.sin(yr)
+        lx, lz = -1.6 * s * cos_y, 1.6 * s * sin_y
+        rx, rz = 1.6 * s * cos_y, -1.6 * s * sin_y
+        return [
+            {
+                "kind": "cylinder",
+                "pos": (px + lx, py + 1.8 * s, pz + lz),
+                "rot": (0.0, 1.0, 0.0, yaw),
+                "scale": (1.0, 1.0, 1.0),
+                "radius": 0.25 * s,
+                "height": 3.6 * s,
+                "diff": diff,
+                "emis": emis,
+                "alpha": a_val,
+            },
+            {
+                "kind": "cylinder",
+                "pos": (px + rx, py + 1.8 * s, pz + rz),
+                "rot": (0.0, 1.0, 0.0, yaw),
+                "scale": (1.0, 1.0, 1.0),
+                "radius": 0.25 * s,
+                "height": 3.6 * s,
+                "diff": diff,
+                "emis": emis,
+                "alpha": a_val,
+            },
+            {
+                "kind": "box",
+                "pos": (px, py + 3.75 * s, pz),
+                "rot": (0.0, 1.0, 0.0, yaw),
+                "scale": (1.0, 1.0, 1.0),
+                "size": (3.8 * s, 0.35 * s, 0.8 * s),
+                "diff": diff,
+                "emis": (diff[0] * 0.75, diff[1] * 0.75, diff[2] * 0.75),
+                "alpha": a_val,
+            },
+        ]
+
+    if sh == "pillar":
+        return [{
+            "kind": "cylinder",
+            "pos": (px, py + 2.0 * s, pz),
+            "rot": (0.0, 1.0, 0.0, yaw),
+            "scale": (1.0, 1.0, 1.0),
+            "radius": 0.45 * s,
+            "height": 4.0 * s,
+            "diff": diff,
+            "emis": emis,
+            "alpha": a_val,
+        }]
+    if sh == "sphere":
+        return [{
+            "kind": "sphere",
+            "pos": (px, py + 1.0 * s, pz),
+            "rot": (0.0, 1.0, 0.0, yaw),
+            "scale": (1.0, 1.0, 1.0),
+            "radius": 1.0 * s,
+            "diff": diff,
+            "emis": emis,
+            "alpha": a_val,
+        }]
+    if sh == "cone":
+        return [{
+            "kind": "cone",
+            "pos": (px, py + 1.25 * s, pz),
+            "rot": (0.0, 1.0, 0.0, yaw),
+            "scale": (1.0, 1.0, 1.0),
+            "radius": 1.1 * s,
+            "height": 2.5 * s,
+            "diff": diff,
+            "emis": emis,
+            "alpha": a_val,
+        }]
+    if sh == "platform":
+        return [{
+            "kind": "box",
+            "pos": (px, py + 0.15 * s, pz),
+            "rot": (0.0, 1.0, 0.0, yaw),
+            "scale": (1.0, 1.0, 1.0),
+            "size": (4.0 * s, 0.3 * s, 4.0 * s),
+            "diff": diff,
+            "emis": emis,
+            "alpha": a_val,
+        }]
+    if sh == "wall":
+        return [{
+            "kind": "box",
+            "pos": (px, py + 1.5 * s, pz),
+            "rot": (0.0, 1.0, 0.0, yaw),
+            "scale": (1.0, 1.0, 1.0),
+            "size": (4.5 * s, 3.0 * s, 0.4 * s),
+            "diff": diff,
+            "emis": emis,
+            "alpha": a_val,
+        }]
+    return [{
+        "kind": "box",
+        "pos": (px, py + 1.0 * s, pz),
+        "rot": (0.0, 1.0, 0.0, yaw),
+        "scale": (1.0, 1.0, 1.0),
+        "size": (2.0 * s, 2.0 * s, 2.0 * s),
+        "diff": diff,
+        "emis": emis,
+        "alpha": a_val,
+    }]

@@ -16,8 +16,10 @@ from nacl.exceptions import BadSignatureError
 from mv3d import (
     _finite_int,
     build_default_hub_md,
+    build_placed_media_snippet,
     build_placed_mv3d_snippet,
     build_placed_portal_snippet,
+    is_safe_media_url,
     compute_md_sha256,
     build_stamped_prefab_snippet,
     extract_placed_blueprint_md,
@@ -1300,6 +1302,7 @@ async def handler(websocket):
                                 warn_missing = f" (note: local world '{dest_w}' does not exist yet)"
                         await websocket.send(json.dumps({"type": "info", "msg": f"Placed portal [{tid}] -> {dest_label} at ({px:.1f}, {py:.1f}, {pz:.1f}){warn_missing}."}))
 
+                    elif action == "place_media":
                         m_url = str(data.get("url", "") or "").strip()
                         ok_m, err_m = is_safe_media_url(m_url, allow_unresolvable=True)
                         if not ok_m:
@@ -2032,35 +2035,6 @@ async def handler(websocket):
                         names = sorted(p.stem for p in PREFABS_DIR.glob("*.md"))
                     await websocket.send(json.dumps({"type": "prefab_saved", "name": p_name, "count": taken, "prefabs": names, "md": bp_doc}))
 
-                elif action == "preview":
-                    p_name = sanitize_name(str(data.get("name", "")))
-                    p_path = _safe_child_path(PREFABS_DIR, f"{p_name}.md")
-                    if not p_name or p_path is None or not p_path.exists():
-                        await websocket.send(json.dumps({"type": "error", "msg": f"Blueprint '{p_name}' not found."}))
-                        continue
-                    bp_md = read_md_safe(p_path)
-                    sc_p = parse_mv3d(bp_md)
-                    await websocket.send(json.dumps({
-                        "type": "prefab_preview",
-                        "name": p_name,
-                        "parts_count": len(sc_p.get("objects", [])),
-                        "description": sc_p.get("world_info_desc", ""),
-                        "md": bp_md,
-                    }))
-                elif action == "delete":
-                    p_name = sanitize_name(str(data.get("name", "")))
-                    p_path = _safe_child_path(PREFABS_DIR, f"{p_name}.md")
-                    if not p_name or p_path is None or not p_path.exists():
-                        await websocket.send(json.dumps({"type": "error", "msg": f"Blueprint '{p_name}' not found."}))
-                        continue
-                    async with UPLOAD_LOCK:
-                        try:
-                            p_path.unlink()
-                        except OSError:
-                            await websocket.send(json.dumps({"type": "error", "msg": f"Could not delete blueprint '{p_name}'."}))
-                            continue
-                    names = sorted(p.stem for p in PREFABS_DIR.glob("*.md"))
-                    await websocket.send(json.dumps({"type": "prefab_deleted", "name": p_name, "prefabs": names}))
                 elif action == "stamp":
                     p_name = sanitize_name(str(data.get("name", "")))
                     p_path = _safe_child_path(PREFABS_DIR, f"{p_name}.md")
