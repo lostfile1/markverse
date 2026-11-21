@@ -496,7 +496,7 @@ def parse_mv3d(md_text: str) -> dict:
                 "yaw": target_yaw,
                 "server": target_server,
             })
-            # Visual beacon ring/box for portal
+            # Visual beacon ring/box for portal (non-solid for physics, raycastable in inspect mode)
             scene["objects"].append({
                 "kind": "cylinder",
                 "pos": portal_xyz,
@@ -507,6 +507,7 @@ def parse_mv3d(md_text: str) -> dict:
                 "diff": p_col,
                 "emis": (p_col[0] * 0.65, p_col[1] * 0.65, p_col[2] * 0.65),
                 "alpha": 0.45,
+                "is_portal": True,
                 "def_name": cur["def_name"] or f"PORTAL_{dest_w}",
             })
         elif prop == "trigger" and isinstance(val, dict):
@@ -789,6 +790,53 @@ def build_placed_mv3d_snippet(
     )
 
 
+def build_placed_portal_snippet(
+    dest_world: str,
+    x: float,
+    y: float,
+    z: float,
+    rgb: tuple[float, float, float],
+    creator_nick: str,
+    radius: float = 2.0,
+    tag_id: str | None = None,
+    yaw_deg: float = 0.0,
+    target_server: str = "",
+    target_spawn: list[float] | None = None,
+    target_yaw: float | None = None,
+) -> str:
+    tid = (tag_id or secrets.token_hex(3)).lower()
+    safe_nick = re.sub(r"[^a-zA-Z0-9_-]", "", creator_nick)[:24] or "builder"
+    safe_dest = re.sub(r"[^a-zA-Z0-9_-]", "", str(dest_world or "hub"))[:32] or "hub"
+    rad = round(_finite_float(radius, 2.0, 0.5, 15.0), 2)
+    x = _finite_float(x, 0.0, -500.0, 500.0)
+    cy = round(_finite_float(y, 0.0, -100.0, 500.0) + 1.2, 3)
+    z = _finite_float(z, 0.0, -500.0, 500.0)
+    c_hex = rgb_to_hex(rgb)
+    yaw = round(_finite_float(yaw_deg, 0.0) % 360.0, 1)
+
+    fields = [f'to: "{safe_dest}"', f"radius: {rad}", f'color: "{c_hex}"']
+    clean_srv = re.sub(r'[\x00-\x1f\x7f"\'\\\s]', "", str(target_server or ""))[:200]
+    if clean_srv:
+        fields.append(f'server: "{clean_srv}"')
+    if isinstance(target_spawn, (list, tuple)) and len(target_spawn) >= 3:
+        sx = round(_finite_float(target_spawn[0], 0.0, -500.0, 500.0), 2)
+        sy = round(_finite_float(target_spawn[1], 0.0, -100.0, 500.0), 2)
+        sz = round(_finite_float(target_spawn[2], 0.0, -500.0, 500.0), 2)
+        fields.append(f"spawn: [{sx}, {sy}, {sz}]")
+    if target_yaw is not None:
+        tyaw = round(_finite_float(target_yaw, 0.0) % 360.0, 1)
+        fields.append(f"yaw: {tyaw}")
+
+    return (
+        f"<!-- PLACED:{tid} by {safe_nick} portal -->\n"
+        f"# Node: PLACED_{tid}\n"
+        f"* **pos**: [{x:.3f}, {cy:.3f}, {z:.3f}]\n"
+        f"* **rot**: [0, {yaw}, 0]\n"
+        f"* **scale**: [1.0, 1.0, 1.0]\n"
+        f"* **portal**: {{ {', '.join(fields)} }}"
+    )
+
+
 def _find_placed_md_span(md_text: str, target_tag_id: str) -> tuple[int, int, str] | None:
     clean_id = re.sub(r"[^a-fA-F0-9]", "", target_tag_id).lower()
     if not clean_id:
@@ -860,6 +908,12 @@ def mutate_placed_md_snippet(
 
     if op == "scale":
         mult = max(0.2, min(5.0, _finite_float(scale_mult, 1.0, 0.2, 5.0)))
+        if "**portal**" in block:
+            m_pr = re.search(r"(\*\s+\*\*portal\*\*:[^\n]*\bradius:\s*)([-+]?(?:\d*\.\d+|\d+))", block)
+            if m_pr:
+                new_rad = max(0.5, min(15.0, round(_finite_float(m_pr.group(2), 2.0, 0.5, 15.0) * mult, 2)))
+                new_block = block[: m_pr.start()] + f"{m_pr.group(1)}{new_rad}" + block[m_pr.end() :]
+                return md_text[:start_idx] + new_block + md_text[end_idx:], True, f"Scaled portal [{canon_id}] radius to {new_rad}m."
         m_sc = re.search(r"(\*\s+\*\*scale\*\*:\s*\[)([^\]]+)(\])", block)
         if not m_sc:
             return md_text, False, "Could not parse object scale."

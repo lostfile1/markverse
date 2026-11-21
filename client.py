@@ -538,8 +538,6 @@ class ModernRenderer:
 
 # --- Spatial Hash Grid & Raycast ---
 def get_object_aabb(obj: dict) -> tuple[float, float, float, float, float, float] | None:
-    if obj.get("alpha", 1.0) < 0.5 and str(obj.get("def_name", "")).startswith("PORTAL_"):
-        return None
     px, py, pz = obj["pos"]
     sx, sy, sz = obj["scale"]
     rx, ry, rz, ang_deg = obj.get("rot", (0.0, 1.0, 0.0, 0.0))
@@ -667,7 +665,11 @@ def find_looked_at_object(cam_pos, yaw_deg, pitch_deg, spatial_hash: SpatialHash
 def step_player_physics(cam_pos, dx, dz, vel_y, jump_pressed, dt, spatial_hash: SpatialHashGrid):
     eye_h, radius, step_height = 1.8, 0.45, 0.65
     dt = min(dt, 0.05)
-    nearby = [box for _, _, box in spatial_hash.query_aabb(cam_pos[0] - 3.0, cam_pos[0] + 3.0, cam_pos[2] - 3.0, cam_pos[2] + 3.0)]
+    nearby = [
+        box
+        for _, obj, box in spatial_hash.query_aabb(cam_pos[0] - 3.0, cam_pos[0] + 3.0, cam_pos[2] - 3.0, cam_pos[2] + 3.0)
+        if not obj.get("is_portal")
+    ]
     orig_feet_y = cam_pos[1] - eye_h
     feet_y = orig_feet_y
 
@@ -716,7 +718,10 @@ def step_player_physics(cam_pos, dx, dz, vel_y, jump_pressed, dt, spatial_hash: 
 # --- Custom Avatar Mesh Normalization ---
 def build_normalized_avatar_mesh(md_text: str) -> dict | None:
     parsed = parse_mv3d(md_text)
-    objs = [o for o in parsed.get("objects", []) if o["kind"] != "grid" and o.get("size", (0, 0, 0))[0] < 20]
+    objs = [
+        o for o in parsed.get("objects", [])
+        if o["kind"] != "grid" and ((o.get("size") or (0, 0, 0))[0] < 20)
+    ]
     if not objs:
         return None
     aabbs = [b for b in (get_object_aabb(o) for o in objs) if b is not None]
@@ -982,6 +987,13 @@ class MakerverseClient:
         self.role = "OFFLINE"
         self.short_id = ""
         self.avatar = "default"
+        if PROFILE_CACHE_FILE.exists():
+            try:
+                p_data = json.loads(PROFILE_CACHE_FILE.read_text(encoding="utf-8"))
+                if isinstance(p_data, dict) and p_data.get("avatar"):
+                    self.avatar = _clean_ident(p_data["avatar"], 32, "default")
+            except Exception:
+                pass
         self.world = "hub"
         self.world_desc = ""
         self.worlds = ["hub"]
@@ -1028,6 +1040,26 @@ class MakerverseClient:
         self.teleport_yaw = None
         self.running = True
 
+    def _save_profile(self):
+        _write_secure_file(
+            PROFILE_CACHE_FILE,
+            json.dumps({"nick": self.nick, "color": self.color, "avatar": self.avatar}, indent=2),
+        )
+
+    def _front_placement_pos(self, dist: float = 4.5, snap: bool = True) -> tuple[float, float, float, float]:
+        rad = math.radians(self.cam_yaw_ref)
+        cx, cy, cz = self.cam_pos_ref
+        rx = cx - math.sin(rad) * dist
+        ry = max(0.0, cy - 1.8)
+        rz = cz - math.cos(rad) * dist
+        px = self._snap_coord(rx) if snap else round(rx, 2)
+        py = self._snap_coord(ry) if snap else round(ry, 2)
+        pz = self._snap_coord(rz) if snap else round(rz, 2)
+        yaw_p = round((-self.cam_yaw_ref) % 360.0, 1)
+        if snap and self.grid_snap > 0.0:
+            yaw_p = round((round(yaw_p / 45.0) * 45.0) % 360.0, 1)
+        return px, py, pz, yaw_p
+
     def log(self, sender: str, color: str, text: str):
         self.chat_log.append((sender, color, re.sub(r"[\x00-\x1f\x7f]", " ", str(text))))
         if len(self.chat_log) > 100:
@@ -1039,6 +1071,8 @@ class MakerverseClient:
                 self.loop.call_soon_threadsafe(self.out_queue.put_nowait, json.dumps(payload))
             except RuntimeError:
                 pass
+        elif payload.get("type") not in ("get_avatar", "move"):
+            self.log("NET", "#ffaa00", "Not connected to server yet; action skipped.")
 
     def _store_avatar_mesh(self, av_name: str, mesh: dict, md_text: str = ""):
         if md_text:
@@ -1351,14 +1385,27 @@ class MakerverseClient:
                                         auth_pkt["avatar_md"] = av_md
                                 await ws.send(json.dumps(auth_pkt))
                             elif mtype == "auth_ok":
+                                prev_av = self.avatar
                                 self.role = data.get("role", "guest").upper()
                                 self.short_id = data.get("short_id", "")
                                 self.nick = data.get("nick", self.nick)
-                                self.avatar = data.get("avatar", self.avatar or "default")
+                                self.avatar = _clean_ident(data.get("avatar", self.avatar or "default"), 32, "default")
                                 self.node_name = data.get("node_name", "Makerverse")
                                 self.worlds = data.get("worlds", ["hub"])
                                 self.avatars = data.get("avatars", [])
+                                srv_av_md = str(data.get("avatar_md", "") or "")
+                                if self.avatar != "default" and srv_av_md:
+                                    mesh = build_normalized_avatar_mesh(srv_av_md)
+                                    if mesh:
+                                        self._store_avatar_mesh(self.avatar, mesh, md_text=srv_av_md)
+                                elif self.avatar != "default" and prev_av != "default" and self.avatar != prev_av:
+                                    old_cached_md = load_cached_avatar_md(prev_av)
+                                    if old_cached_md:
+                                        store_cached_avatar_md(self.avatar, old_cached_md)
+                                self._save_profile()
                                 self._record_recent_server(self.server_url, self.node_name)
+                                if data.get("avatar_synced") and self.avatar != "default":
+                                    self.log("ID", "#00ff66", f"Carried identity & avatar '{self.avatar}' to {self.node_name}.")
                                 self._apply_world(data.get("world", "hub"), data.get("md", ""), data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0))
                             elif mtype == "world_data":
                                 self._apply_world(data.get("world", "hub"), data.get("md", ""), data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0), bool(data.get("in_place")))
@@ -1591,7 +1638,7 @@ class MakerverseClient:
                             elif mtype == "nick_updated":
                                 prev_n = self.nick
                                 self.nick = _clean_ident(data.get("nick", self.nick), 24, self.nick)
-                                _write_secure_file(PROFILE_CACHE_FILE, json.dumps({"nick": self.nick, "color": self.color}, indent=2))
+                                self._save_profile()
                                 if data.get("requested") and data["requested"] != self.nick:
                                     self.log("ID", "#ffaa00", f"'{data['requested']}' taken; set nick to '{self.nick}'.")
                                 elif prev_n != self.nick:
@@ -1632,13 +1679,16 @@ class MakerverseClient:
                                         await ws.send(json.dumps({"type": "join_world", "world": name_up}))
                                 elif kind_up == "avatar":
                                     self.avatar = name_up
+                                    self._save_profile()
                                     if data.get("md"):
                                         mesh = build_normalized_avatar_mesh(data["md"])
                                         if mesh:
                                             self._store_avatar_mesh(name_up, mesh, md_text=data["md"])
+                                            self.log("AVATAR", "#00ff66", f"Equipped avatar '{name_up}' ({len(mesh['objects'])} parts). Press [V] to view.")
                             elif mtype in ("error", "info"):
                                 if data.get("equipped_avatar"):
-                                    self.avatar = str(data["equipped_avatar"])
+                                    self.avatar = _clean_ident(data["equipped_avatar"], 32, "default")
+                                    self._save_profile()
                                 if data.get("avatar_md"):
                                     mesh = build_normalized_avatar_mesh(data["avatar_md"])
                                     if mesh:
@@ -1680,7 +1730,7 @@ def handle_command(client: MakerverseClient, text: str):
     cmd = parts[0].lower()
     if cmd == "/help":
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
-        client.log("HELP", "#ff66cc", "/place <shape> [col] [sc] | /moveobj | /rotateobj | /scaleobj | /paint | /cloneobj | /delobj | /undo | /snap [m] | /watch <world|avatar> <n> <file>")
+        client.log("HELP", "#ff66cc", "/place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] [@x,y,z] | /moveobj | /scaleobj | /paint | /delobj | /undo | /snap [m]")
         client.log("HELP", "#ff66cc", "/perms | /admin <u> | /grant <u> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /allowbuilder <u> | /allowvisitor <u>")
         client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n> | /key")
     elif cmd == "/rate":
@@ -1990,18 +2040,17 @@ def handle_command(client: MakerverseClient, text: str):
                     sc_p = max(0.2, min(10.0, val_s))
             except ValueError:
                 pass
-        rad = math.radians(client.cam_yaw_ref)
-        cx, cy, cz = client.cam_pos_ref
+        px, py, pz, yaw_p = client._front_placement_pos(dist=5.0, snap=False)
         client.send_json({
             "type": "prefab_action",
             "action": "stamp",
             "name": p_nm,
             "world": client.world,
-            "x": round(cx - math.sin(rad) * 5.0, 2),
-            "y": round(max(0.0, cy - 1.8), 2),
-            "z": round(cz - math.cos(rad) * 5.0, 2),
+            "x": px,
+            "y": py,
+            "z": pz,
             "scale": sc_p,
-            "yaw": round((-client.cam_yaw_ref) % 360.0, 1),
+            "yaw": yaw_p,
         })
     elif cmd == "/snap":
         if len(parts) < 2 or not parts[1].strip():
@@ -2064,19 +2113,90 @@ def handle_command(client: MakerverseClient, text: str):
             scale = max(0.2, min(20.0, scale if math.isfinite(scale) else 1.0))
         except ValueError:
             scale = 1.0
-        rad = math.radians(client.cam_yaw_ref)
-        cx, cy, cz = client.cam_pos_ref
-        px = client._snap_coord(cx - math.sin(rad) * 4.5)
-        py = client._snap_coord(max(0.0, cy - 1.8))
-        pz = client._snap_coord(cz - math.cos(rad) * 4.5)
-        yaw_p = round((-client.cam_yaw_ref) % 360.0, 1)
-        if client.grid_snap > 0.0:
-            yaw_p = round((round(yaw_p / 45.0) * 45.0) % 360.0, 1)
+        px, py, pz, yaw_p = client._front_placement_pos(dist=4.5, snap=True)
         client.send_json({
             "type": "world_edit", "action": "place", "world": client.world,
             "shape": shape, "x": px, "y": py, "z": pz,
             "scale": scale, "color": color, "yaw": yaw_p,
         })
+    elif cmd in ("/placeportal", "/portal"):
+        raw_tokens = text.strip().split()[1:]
+        if not raw_tokens:
+            client.log("ERR", "#ff4444", "Usage: /placeportal <world | server/world> [color] [radius] [@x,y,z] [yaw=deg]")
+            return
+        target_spec = raw_tokens[0].strip()
+        target_srv = ""
+        target_w = target_spec
+        if target_spec.startswith(("ws://", "wss://")):
+            try:
+                u_sp = urllib.parse.urlsplit(target_spec)
+                p_path = u_sp.path.strip("/")
+                if u_sp.hostname and p_path:
+                    port_p = u_sp.port or (443 if u_sp.scheme == "wss" else 8765)
+                    target_srv = f"{u_sp.scheme}://{u_sp.hostname}:{port_p}"
+                    target_w = p_path.split("/", 1)[0]
+                else:
+                    client.log("ERR", "#ff4444", "Cross-server portal URL must include /<world> (e.g. ws://host:8765/hub).")
+                    return
+            except Exception:
+                client.log("ERR", "#ff4444", "Malformed portal server/world target.")
+                return
+        elif "/" in target_spec:
+            srv_part, w_part = target_spec.split("/", 1)
+            target_srv = srv_part.strip()
+            target_w = w_part.strip()
+
+        clean_dest = _clean_ident(target_w, 32, "")
+        if not clean_dest:
+            client.log("ERR", "#ff4444", "Specify a valid destination world name.")
+            return
+
+        color = "cyan"
+        p_rad = 2.0
+        t_spawn = None
+        t_yaw = None
+        for tok in raw_tokens[1:]:
+            if tok.startswith("@"):
+                coords = [x.strip() for x in tok[1:].split(",")]
+                if len(coords) >= 3 and all(re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", c) for c in coords[:3]):
+                    t_spawn = [
+                        max(-500.0, min(500.0, float(coords[0]))),
+                        max(-100.0, min(500.0, float(coords[1]))),
+                        max(-500.0, min(500.0, float(coords[2]))),
+                    ]
+                else:
+                    client.log("ERR", "#ff4444", "Spawn override must be @x,y,z (e.g. @0,2,12).")
+                    return
+            elif tok.lower().startswith("yaw=") and re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", tok[4:]):
+                t_yaw = float(tok[4:]) % 360.0
+            elif re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", tok):
+                val_r = float(tok)
+                if math.isfinite(val_r):
+                    p_rad = max(0.5, min(15.0, val_r))
+            else:
+                color = tok
+
+        px, py, pz, yaw_p = client._front_placement_pos(dist=4.5, snap=True)
+        client.portal_cooldown_until = time.time() + 3.0
+        pkt = {
+            "type": "world_edit",
+            "action": "place_portal",
+            "world": client.world,
+            "to": clean_dest,
+            "x": px,
+            "y": py,
+            "z": pz,
+            "radius": p_rad,
+            "color": color,
+            "yaw": yaw_p,
+        }
+        if target_srv:
+            pkt["server"] = target_srv
+        if t_spawn is not None:
+            pkt["spawn"] = t_spawn
+        if t_yaw is not None:
+            pkt["target_yaw"] = t_yaw
+        client.send_json(pkt)
     elif cmd == "/moveobj":
         raw_args = text.strip().split()[1:]
         tid = _target_placed_id(client, raw_args[0] if raw_args else "")
@@ -2206,7 +2326,7 @@ def handle_command(client: MakerverseClient, text: str):
             client.log("ERR", "#ff4444", "Nickname must contain letters, numbers, '_' or '-'.")
             return
         client.nick = clean_n
-        _write_secure_file(PROFILE_CACHE_FILE, json.dumps({"nick": client.nick, "color": client.color}, indent=2))
+        client._save_profile()
         if client.connected and client.short_id:
             client.send_json({"type": "set_nick", "nick": clean_n})
         else:
@@ -2219,18 +2339,31 @@ def handle_command(client: MakerverseClient, text: str):
         else:
             target_av = _clean_ident(parts[1], 32, "default")
             client.avatar = target_av
-            client.send_json({"type": "set_avatar", "name": target_av})
+            client._save_profile()
+            if client.connected and client.short_id:
+                client.send_json({"type": "set_avatar", "name": target_av})
+            else:
+                client.log("AVATAR", "#00ff66", f"Saved avatar '{target_av}' (will sync on connect).")
     elif cmd == "/fly":
         client.fly_mode = not client.fly_mode
         client.log("MOVE", "#00ff66", f"Fly mode {'ON' if client.fly_mode else 'OFF'}")
     elif cmd == "/cam":
         order = ("first", "third", "front")
         client.camera_mode = order[(order.index(client.camera_mode) + 1) % 3]
-    elif cmd == "/upload" and len(parts) >= 4:
-        kind, name, fpath = parts[1].lower(), parts[2], parts[3].strip().strip('"').strip("'")
+    elif cmd == "/upload":
+        if len(parts) < 3 or parts[1].lower() not in ("world", "avatar"):
+            client.log("ERR", "#ff4444", "Usage: /upload <world|avatar> <name> <file.md> (or /upload <world|avatar> <file.md>)")
+            return
+        kind = parts[1].lower()
+        if len(parts) >= 4:
+            name = _clean_ident(parts[2], 32, "")
+            fpath = parts[3].strip().strip('"').strip("'")
+        else:
+            fpath = parts[2].strip().strip('"').strip("'")
+            name = _clean_ident(Path(fpath).stem, 32, "")
         p = Path(fpath).expanduser()
-        if not p.is_file():
-            client.log("ERR", "#ff4444", f"File not found: {p}")
+        if not name or not p.is_file():
+            client.log("ERR", "#ff4444", f"Valid name and existing .md file required (not found: {p})")
             return
         md_content = p.read_text(encoding="utf-8", errors="replace")
         ok, err, _ = validate_mv3d_document(md_content, kind=kind)

@@ -14,8 +14,10 @@ from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
 from mv3d import (
+    _finite_int,
     build_default_hub_md,
     build_placed_mv3d_snippet,
+    build_placed_portal_snippet,
     compute_md_sha256,
     build_stamped_prefab_snippet,
     extract_placed_blueprint_md,
@@ -497,6 +499,23 @@ def _check_rate_limit(buckets: dict, msg_type: str, now: float) -> bool:
     return True
 
 
+def _build_world_data_packet(world: str, md_body: str, w_entry: dict, in_place: bool = True) -> dict:
+    pkt = {
+        "type": "world_data",
+        "world": world,
+        "md_hash": compute_md_sha256(md_body),
+        "description": w_entry.get("description", ""),
+        "radio_url": w_entry.get("radio_url", ""),
+        "radio_name": w_entry.get("radio_name", ""),
+        "md": md_body,
+        "in_place": in_place,
+    }
+    if w_entry.get("spawn_pos"):
+        pkt["spawn_pos"] = w_entry["spawn_pos"]
+        pkt["spawn_yaw"] = float(w_entry.get("spawn_yaw", 0.0) or 0.0)
+    return pkt
+
+
 async def broadcast_world(world: str, payload: dict, exclude_ws=None):
     msg = json.dumps(payload)
     for ws, state in list(CLIENTS.items()):
@@ -864,8 +883,14 @@ async def handler(websocket):
                     req_avatar = sanitize_name(load_perms().get("user_avatars", {}).get(pubkey_hex, "default"))
 
                 av_cand = _safe_child_path(AVATARS_DIR, f"{req_avatar}.md")
-                if req_avatar != "default" and (av_cand is None or not av_cand.exists()):
-                    req_avatar = "default"
+                if req_avatar != "default":
+                    if av_cand is None or not av_cand.exists():
+                        req_avatar = "default"
+                    elif not avatar_synced:
+                        perms_av = load_perms()
+                        if perms_av.get("user_avatars", {}).get(pubkey_hex) != req_avatar:
+                            perms_av["user_avatars"][pubkey_hex] = req_avatar
+                            save_perms(perms_av)
 
                 md_text = read_md_safe(WORLDS_DIR / f"{world}.md")
                 w_meta, _, _ = _effective_world_meta(world, meta.get(world, {}), md_text)
@@ -893,13 +918,16 @@ async def handler(websocket):
                 fed = load_federation()
                 print(f"[AUTH] {nick} ({role}) -> '{world}' [avatar: {req_avatar}] ({len(md_text)} bytes)")
 
+                equipped_av_md = read_md_safe(AVATARS_DIR / f"{req_avatar}.md") if req_avatar != "default" else ""
                 auth_payload = {
                     "type": "auth_ok",
                     "role": role,
                     "nick": nick,
+                    "color": color,
                     "short_id": client_state["short_id"],
                     "avatar": req_avatar,
                     "avatar_synced": avatar_synced,
+                    "avatar_md": equipped_av_md,
                     "node_name": fed.get("node_name", "Makerverse Node"),
                     "world": world,
                     "md_hash": compute_md_sha256(md_text),
@@ -920,8 +948,8 @@ async def handler(websocket):
                 peers = [{k: v for k, v in st.items() if k != "pubkey"} for ws_p, st in CLIENTS.items() if ws_p != websocket and st["world"] == world]
                 await websocket.send(json.dumps({"type": "peers", "peers": peers}))
                 pj = {"type": "peer_join", "peer": {k: v for k, v in client_state.items() if k != "pubkey"}}
-                if avatar_synced and req_avatar != "default":
-                    pj["avatar_md"] = read_md_safe(AVATARS_DIR / f"{req_avatar}.md")
+                if equipped_av_md:
+                    pj["avatar_md"] = equipped_av_md
                 await broadcast_world(world, pj, exclude_ws=websocket)
 
                 fdata = load_friends()
@@ -1022,16 +1050,7 @@ async def handler(websocket):
                                     create_world_snapshot(client_state["world"], label="auto")
                                     updated = read_md_safe(wpath).rstrip() + f"\n\n{rendered}\n"
                                     _atomic_write_text(wpath, updated)
-                                    await broadcast_world(client_state["world"], {
-                                        "type": "world_data",
-                                        "world": client_state["world"],
-                                        "md_hash": compute_md_sha256(updated),
-                                        "md": updated,
-                                        "description": w_meta.get("description", ""),
-                                        "radio_url": w_meta.get("radio_url", ""),
-                                        "radio_name": w_meta.get("radio_name", ""),
-                                        "in_place": True,
-                                    })
+                                    await broadcast_world(client_state["world"], _build_world_data_packet(client_state["world"], updated, w_meta, in_place=True))
                         elif act == "broadcast":
                             for peer_ws in list(CLIENTS.keys()):
                                 try:
@@ -1144,20 +1163,7 @@ async def handler(websocket):
                         continue
 
                     def _world_update_msg(md_body: str) -> dict:
-                        msg = {
-                            "type": "world_data",
-                            "world": target,
-                            "md_hash": compute_md_sha256(md_body),
-                            "description": w_entry.get("description", ""),
-                            "radio_url": w_entry.get("radio_url", ""),
-                            "radio_name": w_entry.get("radio_name", ""),
-                            "md": md_body,
-                            "in_place": True,
-                        }
-                        if w_entry.get("spawn_pos"):
-                            msg["spawn_pos"] = w_entry["spawn_pos"]
-                            msg["spawn_yaw"] = float(w_entry.get("spawn_yaw", 0.0) or 0.0)
-                        return msg
+                        return _build_world_data_packet(target, md_body, w_entry, in_place=True)
 
                     if action in ("set_spawn", "clear_spawn"):
                         cur_md = read_md_safe(md_path)
@@ -1212,6 +1218,62 @@ async def handler(websocket):
                         _atomic_write_text(md_path, updated_md)
                         await broadcast_world(target, _world_update_msg(updated_md))
                         await websocket.send(json.dumps({"type": "info", "msg": f"Placed {shape} [{tid}] at ({px:.1f}, {py:.1f}, {pz:.1f})."}))
+
+                    elif action == "place_portal":
+                        dest_w = sanitize_name(str(data.get("to") or "hub"))
+                        raw_p = (data.get("x", 0.0), data.get("y", 0.0), data.get("z", -4.0), data.get("radius", 2.0), data.get("yaw", 0.0))
+                        if not all(_is_finite_num(v) for v in raw_p):
+                            await websocket.send(json.dumps({"type": "error", "msg": "Invalid portal coordinates or radius."}))
+                            continue
+                        px = max(-500.0, min(500.0, float(raw_p[0])))
+                        py = max(-100.0, min(500.0, float(raw_p[1])))
+                        pz = max(-500.0, min(500.0, float(raw_p[2])))
+                        rad_p = max(0.5, min(15.0, float(raw_p[3])))
+                        yaw_deg = float(raw_p[4])
+
+                        raw_srv = str(data.get("server", "") or "").strip()
+                        clean_srv = ""
+                        if raw_srv:
+                            if raw_srv.startswith(("ws://", "wss://")) or ":" in raw_srv or "." in raw_srv:
+                                ok_u, norm_u, err_u = validate_ws_peer_url(raw_srv)
+                                if not ok_u:
+                                    await websocket.send(json.dumps({"type": "error", "msg": err_u}))
+                                    continue
+                                clean_srv = norm_u
+                            else:
+                                clean_srv = sanitize_name(raw_srv)
+
+                        t_spawn, t_yaw = _sanitize_spawn_override(data.get("spawn"), data.get("target_yaw"))
+                        cur_md = read_md_safe(md_path)
+                        if len(cur_md.encode("utf-8", errors="replace")) > MAX_FILE_SIZE - 4096:
+                            await websocket.send(json.dumps({"type": "error", "msg": "World size limit reached."}))
+                            continue
+                        create_world_snapshot(target, label="auto")
+                        tid = secrets.token_hex(3)
+                        snippet = build_placed_portal_snippet(
+                            dest_world=dest_w,
+                            x=px,
+                            y=py,
+                            z=pz,
+                            rgb=parse_color(data.get("color", "#00ffd9")),
+                            creator_nick=client_state["nick"],
+                            radius=rad_p,
+                            tag_id=tid,
+                            yaw_deg=yaw_deg,
+                            target_server=clean_srv,
+                            target_spawn=t_spawn,
+                            target_yaw=t_yaw,
+                        )
+                        updated_md = cur_md.rstrip() + f"\n\n{snippet}\n"
+                        _atomic_write_text(md_path, updated_md)
+                        await broadcast_world(target, _world_update_msg(updated_md))
+                        dest_label = f"{clean_srv}/{dest_w}" if clean_srv else dest_w
+                        warn_missing = ""
+                        if not clean_srv:
+                            dest_fp = _safe_child_path(WORLDS_DIR, f"{dest_w}.md")
+                            if dest_fp is None or not dest_fp.exists():
+                                warn_missing = f" (note: local world '{dest_w}' does not exist yet)"
+                        await websocket.send(json.dumps({"type": "info", "msg": f"Placed portal [{tid}] -> {dest_label} at ({px:.1f}, {py:.1f}, {pz:.1f}){warn_missing}."}))
 
                     elif action == "mutate_placed":
                         tag_id = re.sub(r"[^a-fA-F0-9]", "", str(data.get("tag_id", ""))).lower()
@@ -1347,16 +1409,7 @@ async def handler(websocket):
                         _atomic_write_text(w_path, content)
                         worlds_list = [f.stem for f in WORLDS_DIR.glob("*.md") if can_visit_world(f.stem, meta.get(f.stem, {}), client_state["pubkey"], client_state["role"])]
                     if not is_new:
-                        await broadcast_world(name, {
-                            "type": "world_data",
-                            "world": name,
-                            "md_hash": compute_md_sha256(content),
-                            "description": w_entry.get("description", ""),
-                            "radio_url": w_entry.get("radio_url", ""),
-                            "radio_name": w_entry.get("radio_name", ""),
-                            "md": content,
-                            "in_place": True,
-                        }, exclude_ws=websocket)
+                        await broadcast_world(name, _build_world_data_packet(name, content, w_entry, in_place=True), exclude_ws=websocket)
                     await websocket.send(json.dumps({"type": "upload_ok", "kind": "world", "name": name, "worlds": worlds_list}))
 
                 elif kind == "avatar":
@@ -1633,20 +1686,7 @@ async def handler(websocket):
                         w_entry["updated_at"] = int(time.time())
                         meta[target] = w_entry
                         save_world_meta(meta)
-                    rest_pkt = {
-                        "type": "world_data",
-                        "world": target,
-                        "md_hash": compute_md_sha256(restored_md),
-                        "description": w_entry.get("description", ""),
-                        "radio_url": w_entry.get("radio_url", ""),
-                        "radio_name": w_entry.get("radio_name", ""),
-                        "md": restored_md,
-                        "in_place": True,
-                    }
-                    if w_entry.get("spawn_pos"):
-                        rest_pkt["spawn_pos"] = w_entry["spawn_pos"]
-                        rest_pkt["spawn_yaw"] = float(w_entry.get("spawn_yaw", 0.0) or 0.0)
-                    await broadcast_world(target, rest_pkt)
+                    await broadcast_world(target, _build_world_data_packet(target, restored_md, w_entry, in_place=True))
                     await websocket.send(json.dumps({"type": "info", "msg": f"Restored '{target}' from {raw_file}."}))
                 elif action == "export":
                     await websocket.send(json.dumps({"type": "world_export_data", "world": target, "md": read_md_safe(md_path), "meta": w_entry, "save_path": str(data.get("save_path", ""))}))
@@ -1767,16 +1807,7 @@ async def handler(websocket):
                     await websocket.send(json.dumps(desc_pkt))
                 if fm_changed and ("sky" in data or "fog" in data):
                     cur_md_now = read_md_safe(md_path)
-                    await broadcast_world(target, {
-                        "type": "world_data",
-                        "world": target,
-                        "md_hash": compute_md_sha256(cur_md_now),
-                        "description": w_entry.get("description", ""),
-                        "radio_url": w_entry.get("radio_url", ""),
-                        "radio_name": w_entry.get("radio_name", ""),
-                        "md": cur_md_now,
-                        "in_place": True,
-                    })
+                    await broadcast_world(target, _build_world_data_packet(target, cur_md_now, w_entry, in_place=True))
 
             elif msg_type == "rate_world":
                 action = str(data.get("action", "list")).lower()
@@ -1988,16 +2019,7 @@ async def handler(websocket):
                             await websocket.send(json.dumps({"type": "error", "msg": "World size limit reached."}))
                             continue
                         _atomic_write_text(md_path, updated_md)
-                        await broadcast_world(target_w, {
-                            "type": "world_data",
-                            "world": target_w,
-                            "md_hash": compute_md_sha256(updated_md),
-                            "description": w_entry.get("description", ""),
-                            "radio_url": w_entry.get("radio_url", ""),
-                            "radio_name": w_entry.get("radio_name", ""),
-                            "md": updated_md,
-                            "in_place": True,
-                        })
+                        await broadcast_world(target_w, _build_world_data_packet(target_w, updated_md, w_entry, in_place=True))
                     await websocket.send(json.dumps({"type": "info", "msg": f"Stamped blueprint '{p_name}' [{tid}] into '{target_w}'."}))
 
     except websockets.exceptions.ConnectionClosed:
