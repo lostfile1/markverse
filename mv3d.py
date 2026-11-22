@@ -1208,11 +1208,64 @@ def build_default_hub_md() -> str:
     return "\n".join(lines) + "\n"
 
 
+TEMPLATE_ALIASES = {
+    "flat": "flat",
+    "grid": "flat",
+    "blank": "flat",
+    "cybercity": "cybercity",
+    "cyber": "cybercity",
+    "city": "cybercity",
+    "forest": "forest",
+    "pine": "forest",
+    "woods": "forest",
+    "desert": "desert",
+    "dunes": "desert",
+    "sand": "desert",
+    "crystal": "crystal",
+    "crystals": "crystal",
+    "arctic": "crystal",
+    "arctic_crystal": "crystal",
+    "arctic-crystal": "crystal",
+    "arcticcrystal": "crystal",
+    "ice": "crystal",
+    "cavern": "crystal",
+    "fortress": "fortress",
+    "citadel": "fortress",
+    "castle": "fortress",
+    "island": "island",
+    "atoll": "island",
+    "tropical": "island",
+    "space": "space",
+    "station": "space",
+    "orbit": "space",
+}
+
+
+def resolve_world_template_match(template_key: str) -> tuple[str, bool]:
+    raw = str(template_key or "").strip().lower()
+    if not raw:
+        return "flat", True
+    if raw in WORLD_TEMPLATES:
+        return raw, True
+    norm = re.sub(r"[^a-z0-9_-]", "", raw)
+    if norm in TEMPLATE_ALIASES:
+        return TEMPLATE_ALIASES[norm], True
+    compact = norm.replace("_", "").replace("-", "")
+    if compact in TEMPLATE_ALIASES:
+        return TEMPLATE_ALIASES[compact], True
+    return "flat", False
+
+
+def resolve_world_template_key(template_key: str) -> str:
+    resolved, _ = resolve_world_template_match(template_key)
+    return resolved
+
+
 def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: str = "") -> str:
-    tkey = template_key.lower() if template_key.lower() in WORLD_TEMPLATES else "flat"
+    tkey = resolve_world_template_key(template_key)
     tmeta = WORLD_TEMPLATES[tkey]
-    title_str = re.sub(r'["\r\n\x00]', " ", (custom_desc or tmeta["label"] or world_name)).strip()[:64]
-    desc_str = re.sub(r'["\r\n\x00]', " ", (custom_desc or tmeta["desc"])).strip()[:200]
+    title_str = re.sub(r'[\\"\r\n\x00]', " ", " ".join(str(tmeta["label"] or world_name).split())).strip()[:64]
+    desc_str = re.sub(r'[\\"\r\n\x00]', " ", " ".join(str(custom_desc or tmeta["desc"]).split())).strip()[:200]
     seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(f"{world_name}:{tkey}")) or 42
 
     themes = {
@@ -1226,13 +1279,15 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
         "space": ('["#03030d", "#170533"]', "#2e3347", "#1af2cc", "#ff850d"),
     }
     sky, ground_c, acc1, acc2 = themes[tkey]
+    tags_val = f"[{tkey}, arctic, makerverse]" if tkey == "crystal" else f"[{tkey}, makerverse]"
+    fog_line = 'fog: { color: "#153652", range: 160 }' if tkey == "crystal" else 'fog: { color: "#0a101d", range: 160 }'
     lines = [
         "---",
         f'title: "{title_str}"',
         f'description: "{desc_str}"',
-        f"tags: [{tkey}, makerverse]",
+        f"tags: {tags_val}",
         f"sky: {sky}",
-        'fog: { color: "#0a101d", range: 160 }',
+        fog_line,
         "spawn: { pos: [0, 2.0, 12.0], yaw: 0 }",
         "---",
         "",
@@ -1248,6 +1303,26 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
             "  * **pos**: [0, 0.08, 0]",
             '  * **box**: { size: [10, 0.16, 10], color: "#142438", glow: "#053342" }',
         ])
+    elif tkey == "crystal":
+        for idx in range(16):
+            ang = (2.0 * math.pi * idx) / 16.0
+            rad = 11.5 + ((idx * 7 + seed) % 12)
+            x = round(math.cos(ang) * rad, 2)
+            z = round(math.sin(ang) * rad - 3.0, 2)
+            if abs(x) < 3.2 and 7.5 < z < 15.0:
+                x = round(x + (5.5 if x >= 0 else -5.5), 2)
+            h = round(3.8 + ((idx * 5 + seed) % 9), 2)
+            r_base = round(max(0.65, h * 0.34), 2)
+            col = acc1 if idx % 2 == 0 else acc2
+            glow_c = col
+            lines.append(f"  ## Part: CrystalSpire_{idx}")
+            lines.append(f"  * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
+            lines.append(f'  * **cone**: {{ radius: {r_base}, height: {h}, color: "{col}", glow: "{glow_c}" }}')
+        for c_i, (cx, cz, ch) in enumerate(((-5.5, 2.0, 5.2), (5.5, 2.0, 5.8), (0.0, -7.5, 7.6))):
+            c_col = acc1 if c_i % 2 == 0 else acc2
+            lines.append(f"  ## Part: CavernCluster_{c_i}")
+            lines.append(f"  * **pos**: [{cx}, {ch * 0.5:.2f}, {cz}]")
+            lines.append(f'  * **cone**: {{ radius: {round(ch * 0.32, 2)}, height: {ch}, color: "{c_col}", glow: "{c_col}" }}')
     else:
         for idx in range(14):
             ang = (2.0 * math.pi * idx) / 14.0
@@ -1257,7 +1332,7 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
             h = round(3.2 + ((idx * 5 + seed) % 9), 2)
             col = acc1 if idx % 2 == 0 else acc2
             lines.append(f"  ## Part: Prop_{idx}")
-            if tkey in ("forest", "desert", "crystal"):
+            if tkey in ("forest", "desert"):
                 lines.append(f"  * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
                 lines.append(f'  * **cone**: {{ radius: {round(h * 0.45, 2)}, height: {h}, color: "{col}", glow: "{acc1}" }}')
             elif tkey == "space":

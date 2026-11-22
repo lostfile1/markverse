@@ -30,6 +30,7 @@ from mv3d import (
     _quat_rotate_vec,
     build_ghost_preview_objects,
     build_template_mv3d_world,
+    resolve_world_template_match,
     compute_md_sha256,
     normalize_expression_name,
     parse_color,
@@ -2079,13 +2080,23 @@ def handle_command(client: MakerverseClient, text: str):
         if cached:
             payload["cached_hash"] = cached["sha256"]
         client.send_json(payload)
+    elif cmd == "/templates":
+        t_items = [f"{k} ({v['label']})" for k, v in WORLD_TEMPLATES.items()]
+        client.log("TEMPLATES", "#00ff66", "Templates: " + ", ".join(t_items))
     elif cmd == "/createworld" and len(parts) > 1:
         wname = _clean_ident(parts[1], 32, "world")
-        tpl = parts[2] if len(parts) > 2 else "flat"
-        raw_desc = parts[3].strip() if len(parts) > 3 else ""
+        raw_rest = text.strip().split(" ", 2)[2].strip() if len(text.strip().split(" ", 2)) >= 3 else "flat"
+        rest_toks = raw_rest.split(" ", 1)
+        raw_tpl = rest_toks[0].strip() if rest_toks and rest_toks[0].strip() else "flat"
+        tkey, matched_tpl = resolve_world_template_match(raw_tpl)
+        if not matched_tpl:
+            client.log("WARN", "#ffaa00", f"Unknown template '{raw_tpl}'; using 'flat'. Run /templates to see options.")
+        raw_desc = rest_toks[1].strip() if len(rest_toks) >= 2 else ""
         desc = raw_desc[1:-1] if len(raw_desc) >= 2 and raw_desc[0] == raw_desc[-1] and raw_desc[0] in ('"', "'") else raw_desc
-        md = build_template_mv3d_world(tpl, wname, desc)
-        client.send_json({"type": "upload", "kind": "world", "name": wname, "content": md, "description": desc})
+        clean_send_desc = re.sub(r'[\\"\r\n\x00]', " ", " ".join(desc.split())).strip()[:200]
+        md = build_template_mv3d_world(tkey, wname, clean_send_desc)
+        client.log("BUILD", "#00ffcc", f"Creating world '{wname}' with template '{tkey}' ({WORLD_TEMPLATES[tkey]['label']})...")
+        client.send_json({"type": "upload", "kind": "world", "name": wname, "content": md, "description": clean_send_desc})
     elif cmd == "/prefabs":
         client.send_json({"type": "prefab_action", "action": "list"})
     elif cmd == "/saveprefab":
