@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -1434,6 +1435,8 @@ class MakerverseClient:
                                     "color": self.color,
                                     "avatar": self.avatar,
                                     "world": target_world,
+                                    "mood": self.mood,
+                                    "mood_pinned": self.mood_pinned,
                                 }
                                 if target_spawn is not None:
                                     auth_pkt["spawn_pos"] = target_spawn
@@ -1740,6 +1743,8 @@ class MakerverseClient:
                                 m_val = normalize_expression_name(str(data.get("mood", "neutral")))
                                 if sid_mo in self.peers:
                                     self.peers[sid_mo]["mood"] = m_val
+                                    if "mood_pinned" in data:
+                                        self.peers[sid_mo]["mood_pinned"] = bool(data["mood_pinned"])
                             elif mtype == "media_sync":
                                 sid_m = str(data.get("screen_id", "") or "")
                                 if sid_m:
@@ -1827,6 +1832,17 @@ def _target_placed_id(client: MakerverseClient, explicit_tok: str = "") -> str:
     return ""
 
 
+def _split_cmd_tokens(raw_text: str) -> list[str]:
+    s = raw_text.strip()
+    if not s:
+        return []
+    try:
+        toks = shlex.split(s, posix=(os.name != "nt"))
+        return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in ('"', "'") else t for t in toks]
+    except ValueError:
+        return s.split()
+
+
 def handle_command(client: MakerverseClient, text: str):
     parts = text.strip().split(" ", 3)
     cmd = parts[0].lower()
@@ -1834,7 +1850,7 @@ def handle_command(client: MakerverseClient, text: str):
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /paint | /delobj | /undo | /snap [m]")
         client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off>")
-        client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n> | /key")
+        client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /peers | /tpwp <wp> | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n>")
     elif cmd == "/rate":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /rate <1..5> [comment] or /rate <world> <1..5> [comment]")
@@ -2059,6 +2075,29 @@ def handle_command(client: MakerverseClient, text: str):
             client.log("WAYPOINTS", "#ffaa00", "No waypoints set. Use /waypoint <name> [x y z].")
         else:
             client.log("WAYPOINTS", "#00ff66", "Active: " + ", ".join(f"{k} ({v[0]:.0f},{v[1]:.0f},{v[2]:.0f})" for k, v in client.waypoints.items()))
+    elif cmd in ("/tpwp", "/waygoto"):
+        if len(parts) < 2 or not parts[1].strip():
+            client.log("ERR", "#ff4444", f"Usage: {cmd} <waypoint_name>")
+            return
+        wp_key = _clean_ident(parts[1].strip(), 24, "")
+        wp_p = client.waypoints.get(wp_key)
+        if not wp_p:
+            client.log("ERR", "#ff4444", f"Waypoint '{parts[1].strip()}' not found.")
+            return
+        client.teleport_req = [float(wp_p[0]), float(wp_p[1]) + 1.8, float(wp_p[2])]
+        client.log("MOVE", "#00ff66", f"Warped to waypoint '{wp_key}'.")
+    elif cmd in ("/peers", "/who"):
+        self_r = normalize_role_name(client.role)
+        self_lbl = f"[{self_r}] " if self_r else ""
+        self_av = f" ({client.avatar})" if client.avatar and client.avatar != "default" else ""
+        entries = [f"{self_lbl}{client.nick} (#{client.short_id or 'local'}){self_av} [you]"]
+        for p in client.peers.values():
+            r_p = normalize_role_name(p.get("role", ""))
+            r_lbl = f"[{r_p}] " if r_p else ""
+            av_p = p.get("avatar", "default")
+            av_lbl = f" ({av_p})" if av_p and av_p != "default" else ""
+            entries.append(f"{r_lbl}{p.get('nick', '?')} (#{p.get('short_id', '')}){av_lbl}")
+        client.log("PEERS", "#00ff66", f"In '{client.world}' ({len(entries)}): " + ", ".join(entries))
     elif cmd == "/setspawn":
         raw_sp_args = text.strip().split()[1:]
         if not raw_sp_args:
@@ -2183,15 +2222,16 @@ def handle_command(client: MakerverseClient, text: str):
                     return
         client.log("BUILD", "#00ff66", f"Grid snap: {client.grid_snap}m" if client.grid_snap > 0.0 else "Grid snap: OFF")
     elif cmd == "/watch":
-        if len(parts) < 4:
+        wtoks = _split_cmd_tokens(text)
+        if len(wtoks) < 4:
             client.log("ERR", "#ff4444", "Usage: /watch <world|avatar> <name> <path/to/file.md>")
             return
-        kind = parts[1].lower()
+        kind = wtoks[1].lower()
         if kind not in ("world", "avatar"):
             client.log("ERR", "#ff4444", "Watch kind must be 'world' or 'avatar'.")
             return
-        w_name = _clean_ident(parts[2], 32, "")
-        fpath = parts[3].strip().strip('"').strip("'")
+        w_name = _clean_ident(wtoks[2], 32, "")
+        fpath = " ".join(wtoks[3:]).strip()
         p = Path(fpath).expanduser().resolve()
         if not w_name or not p.is_file():
             client.log("ERR", "#ff4444", f"Valid name and existing file required: {p}")
@@ -2425,7 +2465,7 @@ def handle_command(client: MakerverseClient, text: str):
         else:
             client.mood = normalize_expression_name(raw_m)
             client.mood_pinned = True
-        client.send_json({"type": "mood_sync", "mood": client.mood})
+        client.send_json({"type": "mood_sync", "mood": client.mood, "mood_pinned": client.mood_pinned})
         client.log("MOOD", "#00ff66", f"Avatar expression set to '{client.mood}'.")
     elif cmd == "/friends":
         client.send_json({"type": "friend_action", "action": "list"})
@@ -2528,15 +2568,16 @@ def handle_command(client: MakerverseClient, text: str):
         order = ("first", "third", "front")
         client.camera_mode = order[(order.index(client.camera_mode) + 1) % 3]
     elif cmd == "/upload":
-        if len(parts) < 3 or parts[1].lower() not in ("world", "avatar"):
+        utoks = _split_cmd_tokens(text)
+        if len(utoks) < 3 or utoks[1].lower() not in ("world", "avatar"):
             client.log("ERR", "#ff4444", "Usage: /upload <world|avatar> <name> <file.md> (or /upload <world|avatar> <file.md>)")
             return
-        kind = parts[1].lower()
-        if len(parts) >= 4:
-            name = _clean_ident(parts[2], 32, "")
-            fpath = parts[3].strip().strip('"').strip("'")
+        kind = utoks[1].lower()
+        if len(utoks) >= 4:
+            name = _clean_ident(utoks[2], 32, "")
+            fpath = " ".join(utoks[3:]).strip()
         else:
-            fpath = parts[2].strip().strip('"').strip("'")
+            fpath = utoks[2].strip()
             name = _clean_ident(Path(fpath).stem, 32, "")
         p = Path(fpath).expanduser()
         if not name or not p.is_file():
@@ -2899,6 +2940,15 @@ def main():
                             client.ghost_dist = min(25.0, round(client.ghost_dist + 0.5, 2))
                         elif event.key == K_i:
                             client.inspect_mode = not client.inspect_mode
+                        elif event.key == K_DELETE and client.inspect_mode and not client.ghost_active:
+                            tid_del = _target_placed_id(client)
+                            if tid_del:
+                                client.send_json({"type": "world_edit", "action": "delete_placed", "world": client.world, "tag_id": tid_del})
+                        elif event.key in (K_MINUS, K_EQUALS) and client.inspect_mode and not client.ghost_active:
+                            tid_sc = _target_placed_id(client)
+                            if tid_sc:
+                                mult_s = 0.8 if event.key == K_MINUS else 1.25
+                                client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "scale", "tag_id": tid_sc, "scale_mult": mult_s})
                         elif event.key == K_v:
                             order = ("first", "third", "front")
                             client.camera_mode = order[(order.index(client.camera_mode) + 1) % 3]

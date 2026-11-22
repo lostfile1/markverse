@@ -467,6 +467,17 @@ def remember_user_nick(pubkey_hex: str, nick: str, perms: dict | None = None):
         save_perms(p_data)
 
 
+def _sync_owner_nick_in_meta(pubkey_hex: str, nick: str):
+    w_meta_all = load_world_meta()
+    changed = False
+    for _w_ent in w_meta_all.values():
+        if isinstance(_w_ent, dict) and _w_ent.get("owner") == pubkey_hex and _w_ent.get("owner_nick") != nick:
+            _w_ent["owner_nick"] = nick
+            changed = True
+    if changed:
+        save_world_meta(w_meta_all)
+
+
 def get_role(pubkey_hex: str) -> str:
     perms = load_perms()
     if pubkey_hex in perms.get("banned", []):
@@ -908,14 +919,7 @@ async def handler(websocket):
                         perms=perms_auth,
                     )
                     remember_user_nick(pubkey_hex, nick, perms=perms_auth)
-                    w_meta_auth = load_world_meta()
-                    auth_meta_changed = False
-                    for _w_ent in w_meta_auth.values():
-                        if isinstance(_w_ent, dict) and _w_ent.get("owner") == pubkey_hex and _w_ent.get("owner_nick") != nick:
-                            _w_ent["owner_nick"] = nick
-                            auth_meta_changed = True
-                    if auth_meta_changed:
-                        save_world_meta(w_meta_auth)
+                    _sync_owner_nick_in_meta(pubkey_hex, nick)
 
                 color = validate_hex_color(data.get("color", "#00ffcc"))
                 meta = load_world_meta()
@@ -965,6 +969,8 @@ async def handler(websocket):
                     "pos": list(sp_pos),
                     "rot": [0.0, 1.0, 0.0, round(math.radians(-sp_yaw), 3)],
                     "avatar": req_avatar,
+                    "mood": sanitize_name(str(data.get("mood", "neutral"))).lower()[:24] or "neutral",
+                    "mood_pinned": bool(data.get("mood_pinned", False)),
                 }
                 CLIENTS[websocket] = client_state
 
@@ -1067,12 +1073,15 @@ async def handler(websocket):
 
             elif msg_type == "mood_sync":
                 mood_val = sanitize_name(str(data.get("mood", "neutral"))).lower()[:24] or "neutral"
+                pinned_val = bool(data.get("mood_pinned", mood_val != "neutral"))
                 client_state["mood"] = mood_val
+                client_state["mood_pinned"] = pinned_val
                 await broadcast_world(client_state["world"], {
                     "type": "mood_sync",
                     "short_id": client_state["short_id"],
                     "nick": client_state["nick"],
                     "mood": mood_val,
+                    "mood_pinned": pinned_val,
                 }, exclude_ws=websocket)
 
             elif msg_type == "chat":
@@ -1598,14 +1607,7 @@ async def handler(websocket):
                     new_nick = allocate_unique_nick(cleaned_nick, client_state["pubkey"], exclude_ws=websocket, perms=perms_nick)
                     client_state["nick"] = new_nick
                     remember_user_nick(client_state["pubkey"], new_nick, perms=perms_nick)
-                    w_meta_all = load_world_meta()
-                    meta_changed = False
-                    for _w_name, _w_ent in w_meta_all.items():
-                        if isinstance(_w_ent, dict) and _w_ent.get("owner") == client_state["pubkey"]:
-                            _w_ent["owner_nick"] = new_nick
-                            meta_changed = True
-                    if meta_changed:
-                        save_world_meta(w_meta_all)
+                    _sync_owner_nick_in_meta(client_state["pubkey"], new_nick)
                 await websocket.send(json.dumps({
                     "type": "nick_updated",
                     "nick": new_nick,
@@ -1627,80 +1629,81 @@ async def handler(websocket):
                 action = str(data.get("action", ""))
                 raw_target = str(data.get("target_key", "")).strip()
                 target_key = raw_target.lower()
-                perms = load_perms()
-                if action == "list_perms":
-                    all_custom = [f.stem for f in WORLDS_DIR.glob("*.md") if f.stem.lower() != "hub"]
-                    await websocket.send(json.dumps({"type": "perms_list", "perms": perms, "current_world_count": len(all_custom)}))
-                    continue
-                if action in ("grant_admin", "revoke_admin", "grant_builder", "revoke_builder", "set_role", "ban", "unban"):
-                    if not re.fullmatch(r"[0-9a-f]{64}", target_key):
-                        resolved_pk, _ = resolve_user_key(raw_target, load_friends(), client_state["pubkey"])
-                        if not resolved_pk:
-                            await websocket.send(json.dumps({"type": "error", "msg": f"User '{raw_target}' not found or ambiguous (pass nick, 8-char ID, or 64-char key)."}))
-                            continue
-                        target_key = resolved_pk
-                    if action == "set_role":
-                        desired_role = str(data.get("role", "")).strip().lower()
-                        if desired_role not in ("admin", "builder", "guest"):
-                            await websocket.send(json.dumps({"type": "error", "msg": "Role must be admin, builder, or guest."}))
-                            continue
-                        if desired_role != "admin" and len(perms["admins"]) <= 1 and target_key in perms["admins"]:
-                            await websocket.send(json.dumps({"type": "error", "msg": "Cannot demote the last admin."}))
-                            continue
-                        perms["banned"] = [k for k in perms["banned"] if k != target_key]
-                        if desired_role == "admin":
+                async with UPLOAD_LOCK:
+                    perms = load_perms()
+                    if action == "list_perms":
+                        all_custom = [f.stem for f in WORLDS_DIR.glob("*.md") if f.stem.lower() != "hub"]
+                        await websocket.send(json.dumps({"type": "perms_list", "perms": perms, "current_world_count": len(all_custom)}))
+                        continue
+                    if action in ("grant_admin", "revoke_admin", "grant_builder", "revoke_builder", "set_role", "ban", "unban"):
+                        if not re.fullmatch(r"[0-9a-f]{64}", target_key):
+                            resolved_pk, _ = resolve_user_key(raw_target, load_friends(), client_state["pubkey"])
+                            if not resolved_pk:
+                                await websocket.send(json.dumps({"type": "error", "msg": f"User '{raw_target}' not found or ambiguous (pass nick, 8-char ID, or 64-char key)."}))
+                                continue
+                            target_key = resolved_pk
+                        if action == "set_role":
+                            desired_role = str(data.get("role", "")).strip().lower()
+                            if desired_role not in ("admin", "builder", "guest"):
+                                await websocket.send(json.dumps({"type": "error", "msg": "Role must be admin, builder, or guest."}))
+                                continue
+                            if desired_role != "admin" and len(perms["admins"]) <= 1 and target_key in perms["admins"]:
+                                await websocket.send(json.dumps({"type": "error", "msg": "Cannot demote the last admin."}))
+                                continue
+                            perms["banned"] = [k for k in perms["banned"] if k != target_key]
+                            if desired_role == "admin":
+                                if target_key not in perms["admins"]:
+                                    perms["admins"].append(target_key)
+                                if target_key not in perms["builders"]:
+                                    perms["builders"].append(target_key)
+                            elif desired_role == "builder":
+                                perms["admins"] = [k for k in perms["admins"] if k != target_key]
+                                if target_key not in perms["builders"]:
+                                    perms["builders"].append(target_key)
+                            else:
+                                perms["admins"] = [k for k in perms["admins"] if k != target_key]
+                                perms["builders"] = [k for k in perms["builders"] if k != target_key]
+                                if perms.get("default_role") == "builder":
+                                    await websocket.send(json.dumps({
+                                        "type": "info",
+                                        "msg": "Note: server default_role is 'builder', so un-explicit users still receive builder rank until /defaultrole guest is set."
+                                    }))
+                        elif action == "grant_admin":
+                            perms["banned"] = [k for k in perms["banned"] if k != target_key]
                             if target_key not in perms["admins"]:
                                 perms["admins"].append(target_key)
                             if target_key not in perms["builders"]:
                                 perms["builders"].append(target_key)
-                        elif desired_role == "builder":
+                        elif action == "revoke_admin":
+                            if len(perms["admins"]) <= 1 and target_key in perms["admins"]:
+                                await websocket.send(json.dumps({"type": "error", "msg": "Cannot remove last admin."}))
+                                continue
                             perms["admins"] = [k for k in perms["admins"] if k != target_key]
+                        elif action == "grant_builder":
+                            perms["banned"] = [k for k in perms["banned"] if k != target_key]
                             if target_key not in perms["builders"]:
                                 perms["builders"].append(target_key)
-                        else:
+                        elif action == "revoke_builder":
+                            perms["builders"] = [k for k in perms["builders"] if k != target_key]
+                        elif action == "ban":
+                            if target_key == client_state["pubkey"]:
+                                await websocket.send(json.dumps({"type": "error", "msg": "Cannot ban yourself."}))
+                                continue
                             perms["admins"] = [k for k in perms["admins"] if k != target_key]
                             perms["builders"] = [k for k in perms["builders"] if k != target_key]
-                            if perms.get("default_role") == "builder":
-                                await websocket.send(json.dumps({
-                                    "type": "info",
-                                    "msg": "Note: server default_role is 'builder', so un-explicit users still receive builder rank until /defaultrole guest is set."
-                                }))
-                    elif action == "grant_admin":
-                        perms["banned"] = [k for k in perms["banned"] if k != target_key]
-                        if target_key not in perms["admins"]:
-                            perms["admins"].append(target_key)
-                        if target_key not in perms["builders"]:
-                            perms["builders"].append(target_key)
-                    elif action == "revoke_admin":
-                        if len(perms["admins"]) <= 1 and target_key in perms["admins"]:
-                            await websocket.send(json.dumps({"type": "error", "msg": "Cannot remove last admin."}))
-                            continue
-                        perms["admins"] = [k for k in perms["admins"] if k != target_key]
-                    elif action == "grant_builder":
-                        perms["banned"] = [k for k in perms["banned"] if k != target_key]
-                        if target_key not in perms["builders"]:
-                            perms["builders"].append(target_key)
-                    elif action == "revoke_builder":
-                        perms["builders"] = [k for k in perms["builders"] if k != target_key]
-                    elif action == "ban":
-                        if target_key == client_state["pubkey"]:
-                            await websocket.send(json.dumps({"type": "error", "msg": "Cannot ban yourself."}))
-                            continue
-                        perms["admins"] = [k for k in perms["admins"] if k != target_key]
-                        perms["builders"] = [k for k in perms["builders"] if k != target_key]
-                        if target_key not in perms["banned"]:
-                            perms["banned"].append(target_key)
-                    elif action == "unban":
-                        perms["banned"] = [k for k in perms["banned"] if k != target_key]
-                elif action == "set_default" and target_key in ("guest", "builder"):
-                    perms["default_role"] = target_key
-                elif action in ("set_max_worlds", "set_user_world_limit") and _is_strict_int(data.get("limit")):
-                    val = max(0, min(100000, int(data["limit"])))
-                    perms["max_total_worlds" if action == "set_max_worlds" else "max_worlds_per_user"] = val
-                else:
-                    await websocket.send(json.dumps({"type": "error", "msg": "Invalid permission command."}))
-                    continue
-                save_perms(perms)
+                            if target_key not in perms["banned"]:
+                                perms["banned"].append(target_key)
+                        elif action == "unban":
+                            perms["banned"] = [k for k in perms["banned"] if k != target_key]
+                    elif action == "set_default" and target_key in ("guest", "builder"):
+                        perms["default_role"] = target_key
+                    elif action in ("set_max_worlds", "set_user_world_limit") and _is_strict_int(data.get("limit")):
+                        val = max(0, min(100000, int(data["limit"])))
+                        perms["max_total_worlds" if action == "set_max_worlds" else "max_worlds_per_user"] = val
+                    else:
+                        await websocket.send(json.dumps({"type": "error", "msg": "Invalid permission command."}))
+                        continue
+                    save_perms(perms)
                 for peer_ws, peer_st in list(CLIENTS.items()):
                     if not target_key or peer_st["pubkey"] == target_key:
                         new_r = get_role(peer_st["pubkey"])
