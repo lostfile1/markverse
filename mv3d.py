@@ -1601,3 +1601,29 @@ def build_ghost_preview_objects(
         "emis": emis,
         "alpha": a_val,
     }]
+
+
+RESERVED_ROLE_LABELS = frozenset({
+    "admin", "builder", "guest", "system", "server",
+    "mod", "moderator", "owner", "staff", "bot",
+})
+
+RANK_BADGE_COLORS = {
+    "ADMIN": "#ff4d94",
+    "BUILDER": "#00e6b8",
+    "GUEST": "#8fa6c2",
+}
+
+
+def normalize_role_name(role_raw: str) -> str:
+    r = str(role_raw or "").strip().upper()
+    return r if r in ("ADMIN", "BUILDER", "GUEST") else ""
+
+
+def format_rank_prefix(role_raw: str) -> str:
+    r = normalize_role_name(role_raw)
+    return f"[{r}]" if r else ""
+
+
+def get_rank_badge_color(role_raw: str) -> str:
+    return RANK_BADGE_COLORS.get(normalize_role_name(role_raw), "#00ffcc")

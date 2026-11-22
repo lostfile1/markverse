@@ -25,6 +25,7 @@ from nacl.signing import SigningKey
 
 from mv3d import (
     PLACED_SHAPES,
+    RESERVED_ROLE_LABELS,
     WORLD_TEMPLATES,
     _axis_angle_to_quat,
     _quat_rotate_vec,
@@ -32,6 +33,9 @@ from mv3d import (
     build_template_mv3d_world,
     resolve_world_template_match,
     compute_md_sha256,
+    format_rank_prefix,
+    get_rank_badge_color,
+    normalize_role_name,
     normalize_expression_name,
     parse_color,
     parse_mv3d,
@@ -964,6 +968,9 @@ class RadioPlayer:
         return self.muted
 
 
+_rank_prefix = format_rank_prefix
+
+
 class MakerverseClient:
     def __init__(self, sk: SigningKey):
         self.sk = sk
@@ -977,25 +984,21 @@ class MakerverseClient:
                 _write_secure_file(PROFILE_CACHE_FILE, _LEGACY_PROFILE_FILE.read_text(encoding="utf-8"))
             except Exception:
                 pass
-        if PROFILE_CACHE_FILE.exists():
-            try:
-                p_data = json.loads(PROFILE_CACHE_FILE.read_text(encoding="utf-8"))
-                if isinstance(p_data, dict) and p_data.get("nick"):
-                    self.nick = _clean_ident(p_data["nick"], 24, self.nick)
-                if isinstance(p_data, dict) and p_data.get("color"):
-                    c_val = str(p_data["color"]).strip().lower()
-                    if re.fullmatch(r"#[0-9a-f]{6}", c_val):
-                        self.color = c_val
-            except Exception:
-                pass
         self.role = "OFFLINE"
         self.short_id = ""
         self.avatar = "default"
         if PROFILE_CACHE_FILE.exists():
             try:
                 p_data = json.loads(PROFILE_CACHE_FILE.read_text(encoding="utf-8"))
-                if isinstance(p_data, dict) and p_data.get("avatar"):
-                    self.avatar = _clean_ident(p_data["avatar"], 32, "default")
+                if isinstance(p_data, dict):
+                    if p_data.get("nick"):
+                        self.nick = _clean_ident(p_data["nick"], 24, self.nick)
+                    if p_data.get("color"):
+                        c_val = str(p_data["color"]).strip().lower()
+                        if re.fullmatch(r"#[0-9a-f]{6}", c_val):
+                            self.color = c_val
+                    if p_data.get("avatar"):
+                        self.avatar = _clean_ident(p_data["avatar"], 32, "default")
             except Exception:
                 pass
         self.world = "hub"
@@ -1018,6 +1021,7 @@ class MakerverseClient:
         self.blocked_users: set[str] = load_blocked_users()
         self.waypoints: dict[str, list[float]] = {}
         self.peers = {}
+        self.media_states: dict[str, dict] = {}
         self.radio = RadioPlayer()
         self.fly_mode = False
         self.inspect_mode = False
@@ -1113,8 +1117,10 @@ class MakerverseClient:
             "yaw": yaw_p,
         })
 
-    def log(self, sender: str, color: str, text: str):
-        self.chat_log.append((sender, color, re.sub(r"[\x00-\x1f\x7f]", " ", str(text))))
+    def log(self, sender: str, color: str, text: str, rank: str = ""):
+        clean_t = re.sub(r"[\x00-\x1f\x7f]", " ", str(text))
+        norm_r = normalize_role_name(rank)
+        self.chat_log.append((sender, color, clean_t, norm_r))
         if len(self.chat_log) > 100:
             self.chat_log.pop(0)
 
@@ -1643,9 +1649,15 @@ class MakerverseClient:
                                     f_id = str(data.get("from_id", "")).strip().lower()
                                     if (f_nick and f_nick in self.blocked_users) or (f_id and f_id in self.blocked_users):
                                         continue
-                                who = data.get("from_nick") if data.get("incoming") else data.get("to_nick")
-                                tag = "PM from" if data.get("incoming") else "PM to"
-                                self.log(f"{tag} {who or '?'}", "#ff66ff", data.get("text", ""))
+                                    who = data.get("from_nick") or "?"
+                                    r_pref = str(data.get("from_rank_prefix") or _rank_prefix(data.get("from_role", ""))).strip()
+                                    tag = "PM from"
+                                else:
+                                    who = data.get("to_nick") or "?"
+                                    r_pref = str(data.get("to_rank_prefix") or _rank_prefix(data.get("to_role", ""))).strip()
+                                    tag = "PM to"
+                                w_role = data.get("from_role", "") if data.get("incoming") else data.get("to_role", "")
+                                self.log(f"{tag} {who}", "#ff66ff", data.get("text", ""), rank=w_role)
                             elif mtype == "teleport":
                                 if data.get("pos") and len(data["pos"]) >= 3:
                                     self.teleport_req = [float(data["pos"][0]), float(data["pos"][1]), float(data["pos"][2])]
@@ -1653,11 +1665,16 @@ class MakerverseClient:
                                     self.log("TELEPORT", "#00ff66", data["msg"])
                             elif mtype == "emote":
                                 sid = data.get("short_id")
+                                em_nick_l = str(data.get("nick", "")).strip().lower()
+                                em_id_l = str(sid or "").strip().lower()
+                                if (em_nick_l and em_nick_l in self.blocked_users) or (em_id_l and em_id_l in self.blocked_users):
+                                    continue
                                 em = str(data.get("emote", "wave")).strip()
                                 if sid in self.peers and em:
                                     self.peers[sid]["emote"] = em
                                     self.peers[sid]["emote_until"] = time.time() + 2.5
-                                self.log("*", "#ff66cc", f"{data.get('nick', '?')} performs /{em}")
+                                peer_r = data.get("role") or (self.peers[sid].get("role", "") if sid in self.peers else (self.role if sid == self.short_id else ""))
+                                self.log("*", "#ff66cc", f"{data.get('nick', '?')} performs /{em}", rank=peer_r)
                             elif mtype == "avatars_list":
                                 self.avatars = data.get("avatars", [])
                                 self.log("AVATARS", "#00ff66", f"Available avatars (active: {data.get('current', self.avatar)}): {', '.join(self.avatars) or 'none'}")
@@ -1688,7 +1705,13 @@ class MakerverseClient:
                                     if mesh:
                                         self._store_avatar_mesh(p_av, mesh, md_text=p_md)
                                 self._ensure_avatar_loaded(p_av)
-                                self.log("WORLD", "#8888ff", f"{p['nick']} joined.")
+                                self.log("WORLD", "#8888ff", f"{p['nick']} joined.", rank=p.get("role", ""))
+                            elif mtype == "peer_role":
+                                sid = data.get("short_id")
+                                new_pr = str(data.get("role", "")).strip()
+                                if sid in self.peers and new_pr:
+                                    self.peers[sid]["role"] = new_pr
+                                    self.log("PERMS", "#ff66cc", f"{self.peers[sid].get('nick', 'Peer')} rank updated:", rank=new_pr)
                             elif mtype == "nick_updated":
                                 prev_n = self.nick
                                 self.nick = _clean_ident(data.get("nick", self.nick), 24, self.nick)
@@ -1717,27 +1740,32 @@ class MakerverseClient:
                                 m_val = normalize_expression_name(str(data.get("mood", "neutral")))
                                 if sid_mo in self.peers:
                                     self.peers[sid_mo]["mood"] = m_val
-                            elif mtype == "mood_sync":
-                                sid_mo = str(data.get("short_id", "") or "")
-                                m_val = normalize_expression_name(str(data.get("mood", "neutral")))
-                                if sid_mo in self.peers:
-                                    self.peers[sid_mo]["mood"] = m_val
                             elif mtype == "media_sync":
                                 sid_m = str(data.get("screen_id", "") or "")
-                                if sid_m and cur_ms.get("id") == sid_m:
-                                    self.media_paused = bool(data.get("paused", self.media_paused))
-                                    self.media_muted = bool(data.get("muted", self.media_muted))
+                                if sid_m:
                                     try:
-                                        self.media_scroll_y = max(0, min(1200, int(data.get("scroll_y", self.media_scroll_y))))
-                                    except Exception:
-                                        pass
-                                    self.media_status_note = f"Synced by {data.get('nick', 'peer')}"
+                                        s_y = max(0, min(1200, int(data.get("scroll_y", 0) or 0)))
+                                    except (TypeError, ValueError):
+                                        s_y = 0
+                                    self.media_states[sid_m] = {
+                                        "paused": bool(data.get("paused", False)),
+                                        "muted": bool(data.get("muted", False)),
+                                        "scroll_y": s_y,
+                                        "updated_by": str(data.get("nick", "peer")),
+                                    }
                             elif mtype == "chat":
-                                c_nick = str(data.get("nick", "")).strip().lower()
-                                c_id = str(data.get("short_id", "")).strip().lower()
-                                if (c_nick and c_nick in self.blocked_users) or (c_id and c_id in self.blocked_users):
+                                sid_c = str(data.get("short_id", "")).strip()
+                                c_nick = str(data.get("nick", "")).strip()
+                                c_nick_l = c_nick.lower()
+                                c_id_l = sid_c.lower()
+                                if (c_nick_l and c_nick_l in self.blocked_users) or (c_id_l and c_id_l in self.blocked_users):
                                     continue
-                                self.log(data.get("nick", "?"), data.get("color", "#00ffcc"), data.get("text", ""))
+                                c_role = data.get("role") or (
+                                    self.peers[sid_c].get("role", "") if sid_c in self.peers else (self.role if sid_c == self.short_id else "")
+                                )
+                                if not c_role and data.get("rank_prefix"):
+                                    c_role = str(data["rank_prefix"]).strip("[] ")
+                                self.log(c_nick or "?", data.get("color", "#00ffcc"), data.get("text", ""), rank=c_role)
                             elif mtype == "upload_ok":
                                 kind_up, name_up = data.get("kind"), data.get("name", "")
                                 if data.get("worlds"):
@@ -1805,7 +1833,7 @@ def handle_command(client: MakerverseClient, text: str):
     if cmd == "/help":
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /paint | /delobj | /undo | /snap [m]")
-        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /grant <u> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /allowbuilder <u> | /allowvisitor <u>")
+        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off>")
         client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n> | /key")
     elif cmd == "/rate":
         if len(parts) < 2 or not parts[1].strip():
@@ -1976,24 +2004,27 @@ def handle_command(client: MakerverseClient, text: str):
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /block <nick|short_id>")
             return
-        tok = parts[1].strip().lower()
+        tok = re.sub(r"^\[[A-Z]+\]\s*", "", parts[1].strip(), flags=re.I).lstrip("#").strip().lower()
+        if not tok:
+            client.log("ERR", "#ff4444", "Specify a valid nickname or short ID to block.")
+            return
         if tok in (client.nick.lower(), client.short_id.lower()):
             client.log("ERR", "#ff4444", "You cannot block yourself.")
             return
         client.blocked_users.add(tok)
         save_blocked_users(client.blocked_users)
-        client.log("BLOCK", "#ffaa00", f"Muted chat/whispers from '{parts[1].strip()}' locally.")
+        client.log("BLOCK", "#ffaa00", f"Muted chat/whispers from '{tok}' locally.")
     elif cmd == "/unblock":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /unblock <nick|short_id>")
             return
-        tok = parts[1].strip().lower()
+        tok = re.sub(r"^\[[A-Z]+\]\s*", "", parts[1].strip(), flags=re.I).lstrip("#").strip().lower()
         if tok in client.blocked_users:
             client.blocked_users.remove(tok)
             save_blocked_users(client.blocked_users)
-            client.log("BLOCK", "#00ff66", f"Unblocked '{parts[1].strip()}'.")
+            client.log("BLOCK", "#00ff66", f"Unblocked '{tok}'.")
         else:
-            client.log("ERR", "#ff4444", f"'{parts[1].strip()}' is not in your block list.")
+            client.log("ERR", "#ff4444", f"'{tok or parts[1].strip()}' is not in your block list.")
     elif cmd == "/blocked":
         client.log("BLOCK", "#00ffcc", "Blocked users: " + (", ".join(sorted(client.blocked_users)) or "none"))
     elif cmd == "/waypoint":
@@ -2407,13 +2438,21 @@ def handle_command(client: MakerverseClient, text: str):
         client.log("PUBKEY", "#00ff66", f"{client.pubkey_hex} (ID: {client.short_id}, Role: {client.role})")
     elif cmd == "/perms":
         client.send_json({"type": "admin_perm", "action": "list_perms"})
-    elif cmd in ("/admin", "/unadmin", "/grant", "/ungrant", "/ban", "/unban", "/defaultrole"):
+    elif cmd == "/setrole":
+        raw_sr = text.strip().split()[1:]
+        if len(raw_sr) < 2 or raw_sr[1].strip().lower() not in ("admin", "builder", "guest"):
+            client.log("ERR", "#ff4444", "Usage: /setrole <nick|id|pubkey> <admin|builder|guest>")
+            return
+        client.send_json({"type": "admin_perm", "action": "set_role", "target_key": raw_sr[0].strip(), "role": raw_sr[1].strip().lower()})
+    elif cmd in ("/admin", "/unadmin", "/builder", "/unbuilder", "/grant", "/ungrant", "/ban", "/unban", "/defaultrole"):
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", f"Usage: {cmd} <nick|id|pubkey>" if cmd != "/defaultrole" else "Usage: /defaultrole <guest|builder>")
             return
         act_map = {
             "/admin": "grant_admin",
             "/unadmin": "revoke_admin",
+            "/builder": "grant_builder",
+            "/unbuilder": "revoke_builder",
             "/grant": "grant_builder",
             "/ungrant": "revoke_builder",
             "/ban": "ban",
@@ -2459,6 +2498,9 @@ def handle_command(client: MakerverseClient, text: str):
         clean_n = _clean_ident(parts[1].strip(), 24)
         if not clean_n:
             client.log("ERR", "#ff4444", "Nickname must contain letters, numbers, '_' or '-'.")
+            return
+        if clean_n.lower() in RESERVED_ROLE_LABELS:
+            client.log("ERR", "#ff4444", f"'{clean_n}' is a reserved rank/system name.")
             return
         client.nick = clean_n
         client._save_profile()
@@ -3071,8 +3113,20 @@ def main():
                     head_y = py + (av_m["height"] + 0.35 if av_m else 2.2)
                     screen_pt = project_3d_to_2d((px, head_y, pz), vp_mat)
                     if screen_pt:
-                        av_tag = f" [{peer['avatar']}]" if peer.get("avatar") and peer.get("avatar") != "default" else ""
-                        renderer.draw_text_2d(font, screen_pt[0] - 30, screen_pt[1], f"{peer.get('nick', 'Peer')}{av_tag}", (255, 140, 230))
+                        p_role = normalize_role_name(peer.get("role", ""))
+                        p_badge = f"[{p_role}] " if p_role else ""
+                        av_tag = f" ({peer['avatar']})" if peer.get("avatar") and peer.get("avatar") != "default" else ""
+                        name_body = f"{peer.get('nick', 'Peer')}{av_tag}"
+                        badge_w = font.size(p_badge)[0] if p_badge else 0
+                        total_w = badge_w + font.size(name_body)[0] + 10
+                        tx_n = screen_pt[0] - total_w * 0.5
+                        ty_n = screen_pt[1] - 10
+                        renderer.draw_rect_2d(tx_n, ty_n - 2, total_w, 20, (0.03, 0.02, 0.09, 0.78))
+                        if p_badge:
+                            bhx = get_rank_badge_color(p_role).lstrip("#")
+                            brgb = (int(bhx[0:2], 16), int(bhx[2:4], 16), int(bhx[4:6], 16))
+                            renderer.draw_text_2d(font, tx_n + 5, ty_n, p_badge, brgb)
+                        renderer.draw_text_2d(font, tx_n + 5 + badge_w, ty_n, name_body, (255, 165, 235))
 
                 box_w = min(640, max(320, WINDOW_W - 24))
                 box_x, box_y, box_h = 12, WINDOW_H - 212, 200
@@ -3080,14 +3134,36 @@ def main():
                 renderer.draw_rect_2d(box_x, box_y, box_w, box_h, (0.03, 0.02, 0.08, 0.84))
 
                 wrapped_entries = []
-                for sender, hex_c, msg in client.chat_log[-10:]:
+                for entry in client.chat_log[-10:]:
+                    sender, hex_c, msg = entry[0], entry[1], entry[2]
+                    rank_tag = entry[3] if len(entry) >= 4 else ""
                     hc = hex_c.lstrip("#")
                     rgb = (int(hc[0:2], 16), int(hc[2:4], 16), int(hc[4:6], 16)) if len(hc) == 6 else (0, 255, 204)
-                    for line_str in _wrap_hud_line(font, f"<{sender}> {msg}", inner_max_w):
-                        wrapped_entries.append((line_str, rgb))
+                    badge_txt = f"[{rank_tag}] " if rank_tag else ""
+                    bhx = get_rank_badge_color(rank_tag).lstrip("#") if rank_tag else ""
+                    badge_rgb = (int(bhx[0:2], 16), int(bhx[2:4], 16), int(bhx[4:6], 16)) if len(bhx) == 6 else rgb
+                    full_line = f"{badge_txt}{sender}: {msg}" if sender != "*" else f"* {badge_txt}{msg}"
+                    for l_idx, line_str in enumerate(_wrap_hud_line(font, full_line, inner_max_w)):
+                        if l_idx == 0 and badge_txt:
+                            if sender == "*" and line_str.startswith(f"* {badge_txt}"):
+                                wrapped_entries.append(("* ", rgb, badge_txt, badge_rgb, line_str[2 + len(badge_txt):], rgb))
+                            elif line_str.startswith(badge_txt):
+                                wrapped_entries.append(("", rgb, badge_txt, badge_rgb, line_str[len(badge_txt):], rgb))
+                            else:
+                                wrapped_entries.append(("", rgb, "", badge_rgb, line_str, rgb))
+                        else:
+                            wrapped_entries.append(("", rgb, "", badge_rgb, line_str, rgb))
 
-                for i, (line_str, rgb) in enumerate(wrapped_entries[-7:]):
-                    renderer.draw_text_2d(font, box_x + 10, box_y + 10 + i * 21, line_str, rgb)
+                for i, (pre_s, pre_rgb, b_s, b_rgb, body_s, body_rgb) in enumerate(wrapped_entries[-7:]):
+                    cur_x = box_x + 10
+                    cur_y = box_y + 10 + i * 21
+                    if pre_s:
+                        renderer.draw_text_2d(font, cur_x, cur_y, pre_s, pre_rgb)
+                        cur_x += font.size(pre_s)[0]
+                    if b_s:
+                        renderer.draw_text_2d(font, cur_x, cur_y, b_s, b_rgb)
+                        cur_x += font.size(b_s)[0]
+                    renderer.draw_text_2d(font, cur_x, cur_y, body_s, body_rgb)
 
                 in_x, in_y, in_w, in_h = box_x + 6, box_y + box_h - 32, box_w - 12, 26
                 renderer.draw_rect_2d(in_x, in_y, in_w, in_h, (0.01, 0.01, 0.04, 0.96))

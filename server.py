@@ -14,6 +14,7 @@ from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 
 from mv3d import (
+    RESERVED_ROLE_LABELS,
     _finite_int,
     build_default_hub_md,
     build_placed_media_snippet,
@@ -23,6 +24,7 @@ from mv3d import (
     compute_md_sha256,
     build_stamped_prefab_snippet,
     extract_placed_blueprint_md,
+    format_rank_prefix,
     mutate_placed_md_snippet,
     parse_color,
     parse_mv3d,
@@ -383,6 +385,20 @@ def load_perms():
         ("nick_registry", {}),
     ):
         perms.setdefault(k, dv)
+    seen_nicks: dict[str, str] = {}
+    reg_changed = False
+    for pk, rnick in list(perms["nick_registry"].items()):
+        clean_r = sanitize_name(str(rnick or ""))[:24]
+        low_r = clean_r.lower()
+        if not clean_r or low_r in RESERVED_ROLE_LABELS or low_r in seen_nicks:
+            dedup = f"{(clean_r or 'Maker')[:19]}_{pk[:4]}"
+            perms["nick_registry"][pk] = dedup
+            seen_nicks[dedup.lower()] = pk
+            reg_changed = True
+        else:
+            seen_nicks[low_r] = pk
+    if reg_changed:
+        save_perms(perms)
     return perms
 
 
@@ -415,21 +431,40 @@ def _prune_used_nonces(now: float):
             USED_NONCES.pop(old_n, None)
 
 
-def allocate_unique_nick(desired_nick: str, pubkey_hex: str, exclude_ws=None) -> str:
+def _is_nick_taken(candidate: str, pubkey_hex: str, reg: dict, exclude_ws=None) -> bool:
+    cand_l = candidate.lower()
+    if cand_l in RESERVED_ROLE_LABELS:
+        return True
+    for ws, st in CLIENTS.items():
+        if ws != exclude_ws and st.get("pubkey") != pubkey_hex and st.get("nick", "").lower() == cand_l:
+            return True
+    for reg_pk, reg_nick in reg.items():
+        if reg_pk != pubkey_hex and str(reg_nick or "").strip().lower() == cand_l:
+            return True
+    return False
+
+
+def allocate_unique_nick(desired_nick: str, pubkey_hex: str, exclude_ws=None, perms: dict | None = None) -> str:
+    p_data = perms if perms is not None else load_perms()
+    reg = p_data.setdefault("nick_registry", {})
     base = sanitize_name(desired_nick)[:24] or f"Maker_{pubkey_hex[:6]}"
-    active_nicks = {st["nick"].lower() for ws, st in CLIENTS.items() if ws != exclude_ws}
-    if base.lower() not in active_nicks:
+    if not _is_nick_taken(base, pubkey_hex, reg, exclude_ws=exclude_ws):
         return base
-    tagged = f"{base[:19]}_{pubkey_hex[:4]}"
-    return tagged if tagged.lower() not in active_nicks else f"{base[:15]}_{pubkey_hex[:8]}"
+    tagged4 = f"{base[:19]}_{pubkey_hex[:4]}"
+    if not _is_nick_taken(tagged4, pubkey_hex, reg, exclude_ws=exclude_ws):
+        return tagged4
+    tagged8 = f"{base[:15]}_{pubkey_hex[:8]}"
+    if not _is_nick_taken(tagged8, pubkey_hex, reg, exclude_ws=exclude_ws):
+        return tagged8
+    return f"Maker_{pubkey_hex[:12]}"
 
 
-def remember_user_nick(pubkey_hex: str, nick: str):
-    perms = load_perms()
-    reg = perms.setdefault("nick_registry", {})
+def remember_user_nick(pubkey_hex: str, nick: str, perms: dict | None = None):
+    p_data = perms if perms is not None else load_perms()
+    reg = p_data.setdefault("nick_registry", {})
     if reg.get(pubkey_hex) != nick:
         reg[pubkey_hex] = nick
-        save_perms(perms)
+        save_perms(p_data)
 
 
 def get_role(pubkey_hex: str) -> str:
@@ -449,43 +484,44 @@ def get_role(pubkey_hex: str) -> str:
 
 
 def resolve_user_key(identifier: str, fdata: dict, owner_key: str) -> tuple[str | None, str]:
-    ident = identifier.strip().lower()
+    ident = identifier.strip().lstrip("#").lower()
     if not ident:
         return None, ""
+    reg = load_perms().get("nick_registry", {})
     if re.fullmatch(r"[0-9a-f]{64}", ident):
         for st in CLIENTS.values():
             if st["pubkey"] == ident:
                 return ident, st["nick"]
-        reg = load_perms().get("nick_registry", {})
         return ident, reg.get(ident, ident[:8])
 
-    online_matches = [
-        st for st in CLIENTS.values()
-        if st["short_id"].lower() == ident or st["nick"].lower() == ident
-    ]
-    if len(online_matches) == 1:
-        return online_matches[0]["pubkey"], online_matches[0]["nick"]
-    if len(online_matches) > 1:
-        return None, ""
-
-    reg = load_perms().get("nick_registry", {})
+    online_by_pk = {st["pubkey"]: st for st in CLIENTS.values()}
     known_keys = (
-        set(fdata.get("friends", {}).get(owner_key, []))
+        set(online_by_pk.keys())
+        | set(fdata.get("friends", {}).get(owner_key, []))
         | set(fdata.get("pending", {}).get(owner_key, []))
         | set(reg.keys())
     )
-    exact_matches = []
+    exact_nick_matches = []
+    exact_short_matches = []
     prefix_matches = []
     for k in known_keys:
-        saved_nick = reg.get(k, "")
-        if k == ident or (saved_nick and saved_nick.lower() == ident):
-            exact_matches.append((k, saved_nick or k[:8]))
+        cur_nick = online_by_pk[k]["nick"] if k in online_by_pk else reg.get(k, "")
+        if cur_nick and cur_nick.lower() == ident:
+            exact_nick_matches.append((k, cur_nick))
+        elif len(ident) >= 8 and k.lower().startswith(ident):
+            exact_short_matches.append((k, cur_nick or k[:8]))
         elif len(ident) >= 6 and k.lower().startswith(ident):
-            prefix_matches.append((k, saved_nick or k[:8]))
+            prefix_matches.append((k, cur_nick or k[:8]))
 
-    if len(exact_matches) == 1:
-        return exact_matches[0]
-    if not exact_matches and len(prefix_matches) == 1:
+    if len(exact_nick_matches) == 1:
+        return exact_nick_matches[0]
+    if len(exact_nick_matches) > 1:
+        return None, ""
+    if len(exact_short_matches) == 1:
+        return exact_short_matches[0]
+    if len(exact_short_matches) > 1:
+        return None, ""
+    if len(prefix_matches) == 1:
         return prefix_matches[0]
     return None, ""
 
@@ -862,9 +898,24 @@ async def handler(websocket):
                         except Exception:
                             pass
 
-                saved_nick = load_perms().get("nick_registry", {}).get(pubkey_hex, "")
-                nick = allocate_unique_nick(str(data.get("nick") or saved_nick or f"Maker_{pubkey_hex[:6]}"), pubkey_hex, exclude_ws=websocket)
-                remember_user_nick(pubkey_hex, nick)
+                async with UPLOAD_LOCK:
+                    perms_auth = load_perms()
+                    saved_nick = perms_auth.get("nick_registry", {}).get(pubkey_hex, "")
+                    nick = allocate_unique_nick(
+                        str(data.get("nick") or saved_nick or f"Maker_{pubkey_hex[:6]}"),
+                        pubkey_hex,
+                        exclude_ws=websocket,
+                        perms=perms_auth,
+                    )
+                    remember_user_nick(pubkey_hex, nick, perms=perms_auth)
+                    w_meta_auth = load_world_meta()
+                    auth_meta_changed = False
+                    for _w_ent in w_meta_auth.values():
+                        if isinstance(_w_ent, dict) and _w_ent.get("owner") == pubkey_hex and _w_ent.get("owner_nick") != nick:
+                            _w_ent["owner_nick"] = nick
+                            auth_meta_changed = True
+                    if auth_meta_changed:
+                        save_world_meta(w_meta_auth)
 
                 color = validate_hex_color(data.get("color", "#00ffcc"))
                 meta = load_world_meta()
@@ -1035,6 +1086,8 @@ async def handler(websocket):
                             "type": "emote",
                             "short_id": client_state["short_id"],
                             "nick": client_state["nick"],
+                            "role": client_state["role"],
+                            "rank_prefix": format_rank_prefix(client_state["role"]),
                             "emote": em_name,
                         })
                     else:
@@ -1090,6 +1143,8 @@ async def handler(websocket):
                     "type": "chat",
                     "short_id": client_state["short_id"],
                     "nick": client_state["nick"],
+                    "role": client_state["role"],
+                    "rank_prefix": format_rank_prefix(client_state["role"]),
                     "color": client_state["color"],
                     "text": text,
                 })
@@ -1538,10 +1593,11 @@ async def handler(websocket):
                     await websocket.send(json.dumps({"type": "error", "msg": "Nickname must contain letters, numbers, '_' or '-'."}))
                     continue
                 async with UPLOAD_LOCK:
+                    perms_nick = load_perms()
                     old_nick = client_state["nick"]
-                    new_nick = allocate_unique_nick(cleaned_nick, client_state["pubkey"], exclude_ws=websocket)
+                    new_nick = allocate_unique_nick(cleaned_nick, client_state["pubkey"], exclude_ws=websocket, perms=perms_nick)
                     client_state["nick"] = new_nick
-                    remember_user_nick(client_state["pubkey"], new_nick)
+                    remember_user_nick(client_state["pubkey"], new_nick, perms=perms_nick)
                     w_meta_all = load_world_meta()
                     meta_changed = False
                     for _w_name, _w_ent in w_meta_all.items():
@@ -1576,22 +1632,54 @@ async def handler(websocket):
                     all_custom = [f.stem for f in WORLDS_DIR.glob("*.md") if f.stem.lower() != "hub"]
                     await websocket.send(json.dumps({"type": "perms_list", "perms": perms, "current_world_count": len(all_custom)}))
                     continue
-                if action in ("grant_admin", "revoke_admin", "grant_builder", "revoke_builder", "ban", "unban"):
+                if action in ("grant_admin", "revoke_admin", "grant_builder", "revoke_builder", "set_role", "ban", "unban"):
                     if not re.fullmatch(r"[0-9a-f]{64}", target_key):
                         resolved_pk, _ = resolve_user_key(raw_target, load_friends(), client_state["pubkey"])
                         if not resolved_pk:
                             await websocket.send(json.dumps({"type": "error", "msg": f"User '{raw_target}' not found or ambiguous (pass nick, 8-char ID, or 64-char key)."}))
                             continue
                         target_key = resolved_pk
-                    if action == "grant_admin" and target_key not in perms["admins"]:
-                        perms["admins"].append(target_key)
+                    if action == "set_role":
+                        desired_role = str(data.get("role", "")).strip().lower()
+                        if desired_role not in ("admin", "builder", "guest"):
+                            await websocket.send(json.dumps({"type": "error", "msg": "Role must be admin, builder, or guest."}))
+                            continue
+                        if desired_role != "admin" and len(perms["admins"]) <= 1 and target_key in perms["admins"]:
+                            await websocket.send(json.dumps({"type": "error", "msg": "Cannot demote the last admin."}))
+                            continue
+                        perms["banned"] = [k for k in perms["banned"] if k != target_key]
+                        if desired_role == "admin":
+                            if target_key not in perms["admins"]:
+                                perms["admins"].append(target_key)
+                            if target_key not in perms["builders"]:
+                                perms["builders"].append(target_key)
+                        elif desired_role == "builder":
+                            perms["admins"] = [k for k in perms["admins"] if k != target_key]
+                            if target_key not in perms["builders"]:
+                                perms["builders"].append(target_key)
+                        else:
+                            perms["admins"] = [k for k in perms["admins"] if k != target_key]
+                            perms["builders"] = [k for k in perms["builders"] if k != target_key]
+                            if perms.get("default_role") == "builder":
+                                await websocket.send(json.dumps({
+                                    "type": "info",
+                                    "msg": "Note: server default_role is 'builder', so un-explicit users still receive builder rank until /defaultrole guest is set."
+                                }))
+                    elif action == "grant_admin":
+                        perms["banned"] = [k for k in perms["banned"] if k != target_key]
+                        if target_key not in perms["admins"]:
+                            perms["admins"].append(target_key)
+                        if target_key not in perms["builders"]:
+                            perms["builders"].append(target_key)
                     elif action == "revoke_admin":
                         if len(perms["admins"]) <= 1 and target_key in perms["admins"]:
                             await websocket.send(json.dumps({"type": "error", "msg": "Cannot remove last admin."}))
                             continue
                         perms["admins"] = [k for k in perms["admins"] if k != target_key]
-                    elif action == "grant_builder" and target_key not in perms["builders"]:
-                        perms["builders"].append(target_key)
+                    elif action == "grant_builder":
+                        perms["banned"] = [k for k in perms["banned"] if k != target_key]
+                        if target_key not in perms["builders"]:
+                            perms["builders"].append(target_key)
                     elif action == "revoke_builder":
                         perms["builders"] = [k for k in perms["builders"] if k != target_key]
                     elif action == "ban":
@@ -1624,7 +1712,18 @@ async def handler(websocket):
                             except Exception:
                                 pass
                         else:
-                            await peer_ws.send(json.dumps({"type": "role_updated", "role": new_r}))
+                            await peer_ws.send(json.dumps({
+                                "type": "role_updated",
+                                "role": new_r,
+                                "rank_prefix": format_rank_prefix(new_r),
+                            }))
+                            await broadcast_world(peer_st["world"], {
+                                "type": "peer_role",
+                                "short_id": peer_st["short_id"],
+                                "nick": peer_st["nick"],
+                                "role": new_r,
+                                "rank_prefix": format_rank_prefix(new_r),
+                            }, exclude_ws=peer_ws)
                 await websocket.send(json.dumps({"type": "info", "msg": f"Updated permissions ({action})."}))
 
             elif msg_type == "world_acl":
@@ -1976,7 +2075,19 @@ async def handler(websocket):
                 elif action == "whisper" and t_key in fdata["friends"][my_key] and t_key in online_by_key:
                     pm_text = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("text", "")))[:300].strip()
                     if pm_text:
-                        pkt = {"type": "whisper", "from_id": client_state["short_id"], "from_nick": client_state["nick"], "to_nick": t_nick, "text": pm_text}
+                        _, t_st_w = online_by_key[t_key]
+                        pkt = {
+                            "type": "whisper",
+                            "from_id": client_state["short_id"],
+                            "from_nick": client_state["nick"],
+                            "from_role": client_state["role"],
+                            "from_rank_prefix": format_rank_prefix(client_state["role"]),
+                            "to_id": t_st_w["short_id"],
+                            "to_nick": t_st_w["nick"],
+                            "to_role": t_st_w["role"],
+                            "to_rank_prefix": format_rank_prefix(t_st_w["role"]),
+                            "text": pm_text,
+                        }
                         await online_by_key[t_key][0].send(json.dumps({**pkt, "incoming": True}))
                         await websocket.send(json.dumps({**pkt, "incoming": False}))
                 elif action == "goto" and t_key in fdata["friends"][my_key] and t_key in online_by_key:
