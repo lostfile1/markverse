@@ -113,6 +113,7 @@ python client.py --data-dir /path/to/data
 ### Worlds, Navigation & Live Editing
 - `/worlds [query]` — List or search accessible worlds by name, description, owner, or `#tag`.
 - `/world <name>` — Join a world.
+- `/templates` — List available world templates (`flat`, `cybercity`, `forest`, `desert`, `crystal`, `fortress`, `island`, `space`).
 - `/createworld <name> [template] [description]` — Create a new world from built-in templates (`flat`, `cybercity`, `forest`, `desert`, `crystal`, `fortress`, `island`, `space`).
 - `/worldinfo [world]` — View world metadata, author, ratings, spawn point, and object counts.
 - `/spawn` — Return to the current world's spawn point.
