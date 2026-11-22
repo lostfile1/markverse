@@ -176,3 +176,13 @@ spawn: { pos: [0, 2.0, 10.0], yaw: 0 }
 * **pos**: [-4.0, 1.2, -6.0]
 * **portal**: { to: "hub", radius: 2.0, color: "#00ffd9" }
 ```
+---
+
+## Feature Freeze Status (`v41`)
+
+This build marks the **feature-freeze polish release** for **Makerverse (`#MV3D`)**:
+
+* **Complete In-Game `/help` Reference**: Surfaces building, blueprint, template world creation, hot-reload watch, mood, peer listing, waypoint warp, and role/ACL commands.
+* **Predictable Local vs. Server Behavior**: Local commands (`/spawn`, `/fly`, `/cam`, `/waypoint`, `/tpwp`, `/nick`, `/avatar`, `/block`) work immediately, while world/server mutations validate roles, ownership, and connection state cleanly.
+* **Focused Core Scope**: No additional feature expansions planned—future updates focus strictly on bug fixes, stability, and regression protection.
+* **Ergonomic Input & Waypoint Cleanup (`v42`)**: Added `Up` / `Down` arrow command history while typing in chat/command mode and `/clearwaypoints` to clear local HUD waypoints at once.
