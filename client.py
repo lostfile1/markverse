@@ -1848,9 +1848,9 @@ def handle_command(client: MakerverseClient, text: str):
     cmd = parts[0].lower()
     if cmd == "/help":
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
-        client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /paint | /delobj | /undo | /snap [m]")
-        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off>")
-        client.log("HELP", "#ff66cc", "/backup | /backups | /restore <file.md> | /export | /peers | /tpwp <wp> | /emote <1-4> | /friends | /addfriend <u> | /msg <u> <txt> | /goto <u> | /hop <node> | /back | /nick <n>")
+        client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /rotateobj | /paint | /cloneobj | /delobj | /undo | /snap [m]")
+        client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /restore <file.md> | /export")
+        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /peers | /mood <expr> | /tpwp <wp> | /hop <node> | /back | /nick <n>")
     elif cmd == "/rate":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /rate <1..5> [comment] or /rate <world> <1..5> [comment]")
@@ -2473,7 +2473,9 @@ def handle_command(client: MakerverseClient, text: str):
         act_m = {"/addfriend": "add", "/accept": "accept", "/goto": "goto"}[cmd]
         client.send_json({"type": "friend_action", "action": act_m, "target": parts[1].strip()})
     elif cmd == "/msg" and len(parts) >= 3:
-        client.send_json({"type": "friend_action", "action": "whisper", "target": parts[1].strip(), "text": parts[2].strip()})
+        msg_txt = " ".join(p for p in parts[2:] if p).strip()
+        if msg_txt:
+            client.send_json({"type": "friend_action", "action": "whisper", "target": parts[1].strip(), "text": msg_txt})
     elif cmd == "/key":
         client.log("PUBKEY", "#00ff66", f"{client.pubkey_hex} (ID: {client.short_id}, Role: {client.role})")
     elif cmd == "/perms":
