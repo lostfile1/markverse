@@ -1021,6 +1021,9 @@ class MakerverseClient:
         self.world_search_query = ""
         self.blocked_users: set[str] = load_blocked_users()
         self.waypoints: dict[str, list[float]] = {}
+        self.cmd_history: list[str] = []
+        self.history_idx: int | None = None
+        self.history_draft: str = ""
         self.peers = {}
         self.media_states: dict[str, dict] = {}
         self.radio = RadioPlayer()
@@ -1823,12 +1826,19 @@ class MakerverseClient:
 
 
 def _target_placed_id(client: MakerverseClient, explicit_tok: str = "") -> str:
-    if explicit_tok and re.fullmatch(r"[0-9a-fA-F]{4,8}", explicit_tok.strip()):
-        return explicit_tok.strip().lower()
+    if explicit_tok and re.fullmatch(r"[a-zA-Z0-9_:-]{1,64}", explicit_tok.strip()):
+        tok_s = explicit_tok.strip()
+        return tok_s.lower() if re.fullmatch(r"[0-9a-fA-F]{4,8}", tok_s) else tok_s
     if client.looked_at_hit is not None:
-        d_name = client.looked_at_hit[0].get("def_name", "")
+        hit_obj = client.looked_at_hit[0]
+        d_name = str(hit_obj.get("def_name") or "").strip()
         if d_name.startswith("PLACED_"):
             return d_name.split("_", 1)[1].lower()
+        if d_name:
+            return d_name
+        n_name = str(hit_obj.get("node_name") or "").strip()
+        if n_name:
+            return n_name.split(":", 1)[-1].strip()
     return ""
 
 
@@ -2075,6 +2085,13 @@ def handle_command(client: MakerverseClient, text: str):
             client.log("WAYPOINTS", "#ffaa00", "No waypoints set. Use /waypoint <name> [x y z].")
         else:
             client.log("WAYPOINTS", "#00ff66", "Active: " + ", ".join(f"{k} ({v[0]:.0f},{v[1]:.0f},{v[2]:.0f})" for k, v in client.waypoints.items()))
+    elif cmd == "/clearwaypoints":
+        if client.waypoints:
+            cnt_w = len(client.waypoints)
+            client.waypoints.clear()
+            client.log("WAYPOINTS", "#00ff66", f"Cleared {cnt_w} waypoint(s).")
+        else:
+            client.log("WAYPOINTS", "#ffaa00", "No waypoints to clear.")
     elif cmd in ("/tpwp", "/waygoto"):
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", f"Usage: {cmd} <waypoint_name>")
@@ -2392,42 +2409,47 @@ def handle_command(client: MakerverseClient, text: str):
         client.send_json(pkt)
     elif cmd == "/moveobj":
         raw_args = text.strip().split()[1:]
-        tid = _target_placed_id(client, raw_args[0] if raw_args else "")
+        explicit_t = raw_args[0] if (raw_args and not re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", raw_args[0])) else ""
+        tid = _target_placed_id(client, explicit_t)
         nums = [float(x) for x in raw_args if re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", x)]
         if not tid or len(nums) < 3:
-            client.log("ERR", "#ff4444", "Aim at a placed object with [I] and run /moveobj <dx> <dy> <dz>")
+            client.log("ERR", "#ff4444", "Aim at an object with [I] and run /moveobj [target] <dx> <dy> <dz>")
             return
         client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "move", "tag_id": tid, "dx": nums[0], "dy": nums[1], "dz": nums[2]})
     elif cmd == "/scaleobj":
         raw_args = text.strip().split()[1:]
-        tid = _target_placed_id(client, raw_args[0] if raw_args else "")
+        explicit_t = raw_args[0] if (raw_args and not re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", raw_args[0])) else ""
+        tid = _target_placed_id(client, explicit_t)
         nums = [float(x) for x in raw_args if re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", x)]
         if not tid or not nums:
-            client.log("ERR", "#ff4444", "Aim at a placed object with [I] and run /scaleobj <multiplier> (e.g. 1.5 or 0.75)")
+            client.log("ERR", "#ff4444", "Aim at an object with [I] and run /scaleobj [target] <multiplier> (e.g. 1.5 or 0.75)")
             return
         client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "scale", "tag_id": tid, "scale_mult": nums[0]})
     elif cmd == "/rotateobj":
         raw_args = text.strip().split()[1:]
-        tid = _target_placed_id(client, raw_args[0] if raw_args else "")
+        explicit_t = raw_args[0] if (raw_args and not re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", raw_args[0])) else ""
+        tid = _target_placed_id(client, explicit_t)
         nums = [float(x) for x in raw_args if re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", x)]
         if not tid or not nums:
-            client.log("ERR", "#ff4444", "Aim at a placed object with [I] and run /rotateobj <degrees>")
+            client.log("ERR", "#ff4444", "Aim at an object with [I] and run /rotateobj [target] <degrees>")
             return
         client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "rotate", "tag_id": tid, "yaw_delta": nums[0]})
     elif cmd == "/paint":
         raw_args = text.strip().split()[1:]
-        tid = _target_placed_id(client, raw_args[0] if raw_args else "")
+        explicit_t = raw_args[0] if len(raw_args) >= 2 else ""
+        tid = _target_placed_id(client, explicit_t)
         col = raw_args[-1] if raw_args else ""
         if not tid or not col:
-            client.log("ERR", "#ff4444", "Aim at a placed object with [I] and run /paint <color|#hex>")
+            client.log("ERR", "#ff4444", "Aim at an object with [I] and run /paint [target] <color|#hex>")
             return
         client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "paint", "tag_id": tid, "color": col})
     elif cmd == "/cloneobj":
         raw_args = text.strip().split()[1:]
-        tid = _target_placed_id(client, raw_args[0] if raw_args else "")
+        explicit_t = raw_args[0] if (raw_args and not re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", raw_args[0])) else ""
+        tid = _target_placed_id(client, explicit_t)
         nums = [float(x) for x in raw_args if re.fullmatch(r"[-+]?(?:\d*\.\d+|\d+)", x)]
         if not tid:
-            client.log("ERR", "#ff4444", "Aim at a placed object with [I] and run /cloneobj [dx dy dz]")
+            client.log("ERR", "#ff4444", "Aim at an object with [I] and run /cloneobj [target] [dx dy dz]")
             return
         client.send_json({
             "type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "clone", "tag_id": tid,
@@ -2438,7 +2460,7 @@ def handle_command(client: MakerverseClient, text: str):
         if tid:
             client.send_json({"type": "world_edit", "action": "delete_placed", "world": client.world, "tag_id": tid})
         else:
-            client.log("ERR", "#ff4444", "Aim at a placed object with [I] or pass /delobj <id>.")
+            client.log("ERR", "#ff4444", "Aim at an object with [I] or pass /delobj <id|node_name>.")
     elif cmd == "/undo":
         client.send_json({"type": "world_edit", "action": "undo", "world": client.world})
     elif cmd == "/backup":
@@ -2885,14 +2907,39 @@ def main():
                         has_shortcut_mod = bool(mods & (KMOD_CTRL | KMOD_META))
                         if event.key == K_ESCAPE:
                             chat_mode, chat_buffer = False, ""
+                            client.history_idx = None
+                            client.history_draft = ""
                             if mouse_grabbed:
                                 pygame.event.set_grab(True); pygame.mouse.set_visible(False)
                         elif event.key == K_RETURN:
-                            if chat_buffer.strip():
+                            trimmed_cmd = chat_buffer.strip()
+                            if trimmed_cmd:
+                                if not client.cmd_history or client.cmd_history[-1] != trimmed_cmd:
+                                    client.cmd_history.append(trimmed_cmd)
+                                    if len(client.cmd_history) > 50:
+                                        client.cmd_history.pop(0)
                                 handle_command(client, chat_buffer)
                             chat_buffer, chat_mode = "", False
+                            client.history_idx = None
+                            client.history_draft = ""
                             if mouse_grabbed:
                                 pygame.event.set_grab(True); pygame.mouse.set_visible(False)
+                        elif event.key == K_UP:
+                            if client.cmd_history:
+                                if client.history_idx is None:
+                                    client.history_draft = chat_buffer
+                                    client.history_idx = len(client.cmd_history) - 1
+                                elif client.history_idx > 0:
+                                    client.history_idx -= 1
+                                chat_buffer = client.cmd_history[client.history_idx]
+                        elif event.key == K_DOWN:
+                            if client.history_idx is not None:
+                                if client.history_idx + 1 < len(client.cmd_history):
+                                    client.history_idx += 1
+                                    chat_buffer = client.cmd_history[client.history_idx]
+                                else:
+                                    client.history_idx = None
+                                    chat_buffer = client.history_draft
                         elif event.key == K_BACKSPACE:
                             chat_buffer = chat_buffer[:-1]
                         elif has_shortcut_mod and event.key == K_v:
@@ -2975,6 +3022,8 @@ def main():
                             client.send_json({"type": "chat", "text": f"/emote {em_n}"})
                         elif event.key in (K_t, K_RETURN, K_SLASH):
                             chat_mode = True
+                            client.history_idx = None
+                            client.history_draft = ""
                             chat_buffer = "/" if event.key == K_SLASH else ""
                             pygame.event.set_grab(False); pygame.mouse.set_visible(True)
                 elif event.type == MOUSEBUTTONDOWN and not chat_mode and mouse_grabbed:
@@ -3251,10 +3300,16 @@ def main():
                     if client.looked_at_hit is not None:
                         hit_obj, hit_dist, _, _ = client.looked_at_hit
                         hx_p, hy_p, hz_p = hit_obj["pos"]
-                        d_name = hit_obj.get("def_name", "")
-                        tag_lbl = f" [{d_name.split('_', 1)[1]}]" if d_name.startswith("PLACED_") else ""
+                        d_name = str(hit_obj.get("def_name") or "").strip()
+                        if d_name.startswith("PLACED_"):
+                            tag_lbl = f" [{d_name.split('_', 1)[1]}]"
+                        elif d_name:
+                            tag_lbl = f" [{d_name}]"
+                        else:
+                            n_name = str(hit_obj.get("node_name") or "").strip()
+                            tag_lbl = f" [{n_name.split(':', 1)[-1].strip()}]" if n_name else ""
                         renderer.draw_text_2d(font, ix + 10, iy + 8, f"TARGET {hit_obj['kind'].upper()}{tag_lbl} ({hit_dist:.1f}m)", (0, 255, 160))
-                        renderer.draw_text_2d(font, ix + 10, iy + 32, f"XYZ ({hx_p:.1f}, {hy_p:.1f}, {hz_p:.1f}) - [R] Rot45 | /scaleobj /paint /delobj", (255, 150, 220))
+                        renderer.draw_text_2d(font, ix + 10, iy + 32, f"XYZ ({hx_p:.1f}, {hy_p:.1f}, {hz_p:.1f}) - [Del] Remove | [R] Rot45 | /paint", (255, 150, 220))
                     else:
                         renderer.draw_text_2d(font, ix + 10, iy + 20, "INSPECT [I]: Aim reticle at an object", (160, 200, 190))
                 glEnable(GL_DEPTH_TEST)

@@ -1407,7 +1407,7 @@ async def handler(websocket):
                         await websocket.send(json.dumps({"type": "info", "msg": f"Placed media screen [{tid}] at ({px:.1f}, {py:.1f}, {pz:.1f})."}))
 
                     elif action == "mutate_placed":
-                        tag_id = re.sub(r"[^a-fA-F0-9]", "", str(data.get("tag_id", ""))).lower()
+                        tag_id = re.sub(r"[^a-zA-Z0-9_:-]", "", str(data.get("tag_id", ""))).strip()[:64]
                         op = str(data.get("op", "")).strip().lower()
                         raw_m = (data.get("dx", 0.0), data.get("dy", 0.0), data.get("dz", 0.0), data.get("yaw_delta", 0.0), data.get("scale_mult", 1.0))
                         if not all(_is_finite_num(v) for v in raw_m):
@@ -1437,12 +1437,12 @@ async def handler(websocket):
                         await websocket.send(json.dumps({"type": "info", "msg": status_msg}))
 
                     elif action == "delete_placed":
-                        tag_id = re.sub(r"[^a-fA-F0-9]", "", str(data.get("tag_id", ""))).lower()
+                        tag_id = re.sub(r"[^a-zA-Z0-9_:-]", "", str(data.get("tag_id", ""))).strip()[:64]
                         cur_md = read_md_safe(md_path)
                         create_world_snapshot(target, label="auto")
                         updated_md, removed = remove_placed_md_snippet(cur_md, tag_id)
                         if not removed:
-                            await websocket.send(json.dumps({"type": "error", "msg": f"Placed object '{tag_id}' not found."}))
+                            await websocket.send(json.dumps({"type": "error", "msg": f"Target object '{tag_id}' not found."}))
                             continue
                         _atomic_write_text(md_path, updated_md)
                         await broadcast_world(target, _world_update_msg(updated_md))
@@ -2230,4 +2230,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[*] Server stopped cleanly.")

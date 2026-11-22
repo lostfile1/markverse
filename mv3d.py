@@ -1026,20 +1026,65 @@ def build_placed_portal_snippet(
 
 
 def _find_placed_md_span(md_text: str, target_tag_id: str) -> tuple[int, int, str] | None:
-    clean_id = re.sub(r"[^a-fA-F0-9]", "", target_tag_id).lower()
-    if not clean_id:
+    raw_tok = str(target_tag_id or "").strip()
+    if not raw_tok:
         return None
-    m = re.search(rf"<!--\s*PLACED:({re.escape(clean_id)})\b[^>]*-->", md_text, re.I)
-    if not m:
-        return None
-    start_idx = m.start()
-    rest = md_text[m.end() :]
-    own_hdr = re.match(r"\s*#\s+Node:\s*PLACED_[a-fA-F0-9]+\b[^\n]*", rest)
-    search_from = own_hdr.end() if own_hdr else 0
-    nxt = re.search(r"\n(?=#\s+|<!--\s*PLACED:)", rest[search_from:])
-    end_idx = m.end() + search_from + nxt.start() if nxt else len(md_text)
-    return start_idx, end_idx, m.group(1).lower()
 
+    clean_hex = re.sub(r"[^a-fA-F0-9]", "", raw_tok).lower()
+    if clean_hex and re.fullmatch(r"[0-9a-fA-F]{4,8}", raw_tok):
+        m = re.search(rf"<!--\s*PLACED:({re.escape(clean_hex)})\b[^>]*-->", md_text, re.I)
+        if m:
+            start_idx = m.start()
+            rest = md_text[m.end() :]
+            own_hdr = re.match(r"\s*#\s+Node:\s*PLACED_[a-fA-F0-9]+\b[^\n]*", rest)
+            search_from = own_hdr.end() if own_hdr else 0
+            nxt = re.search(r"\n(?=#\s+|<!--\s*PLACED:)", rest[search_from:])
+            end_idx = m.end() + search_from + nxt.start() if nxt else len(md_text)
+            return start_idx, end_idx, m.group(1).lower()
+
+    clean_name = re.sub(r"[^a-zA-Z0-9_:-]", "", raw_tok).lower()
+    if not clean_name:
+        return None
+
+    lines = md_text.splitlines(keepends=True)
+    body_offset = 0
+    if lines and lines[0].strip() == "---":
+        body_offset += len(lines[0])
+        for ln in lines[1:]:
+            body_offset += len(ln)
+            if ln.strip() == "---":
+                break
+
+    body = md_text[body_offset:]
+    hdr_matches = []
+    in_def = False
+    for m_ln in re.finditer(r"^[ \t]*(?:<!--\s*PLACED:([a-fA-F0-9]+)\b[^>]*-->|(#{1,6})\s+(.+))$", body, re.M):
+        hashes = m_ln.group(2)
+        htitle = (m_ln.group(3) or "").strip()
+        if hashes:
+            depth = len(hashes)
+            if re.match(r"^@def\b", htitle, re.I):
+                in_def = True
+            elif depth <= 2:
+                in_def = False
+            label = htitle.split(":", 1)[1].strip() if ":" in htitle else htitle
+            hdr_matches.append((body_offset + m_ln.start(), body_offset + m_ln.end(), depth, label, in_def))
+        else:
+            hdr_matches.append((body_offset + m_ln.start(), body_offset + m_ln.end(), 1, (m_ln.group(1) or "").lower(), False))
+
+    for idx_h, (h_start, h_end, h_depth, h_label, h_in_def) in enumerate(hdr_matches):
+        if h_in_def:
+            continue
+        norm_lbl = re.sub(r"[^a-zA-Z0-9_:-]", "", h_label).lower()
+        if norm_lbl == clean_name or norm_lbl.endswith(":" + clean_name):
+            end_idx = len(md_text)
+            for nxt_start, _, nxt_depth, _, _ in hdr_matches[idx_h + 1 :]:
+                if nxt_depth <= h_depth:
+                    end_idx = nxt_start
+                    break
+            return h_start, end_idx, h_label
+
+    return None
 
 def remove_placed_md_snippet(md_text: str, target_tag_id: str) -> tuple[str, bool]:
     span = _find_placed_md_span(md_text, target_tag_id)
@@ -1063,12 +1108,12 @@ def mutate_placed_md_snippet(
 ) -> tuple[str, bool, str]:
     span = _find_placed_md_span(md_text, target_tag_id)
     if span is None:
-        return md_text, False, f"Placed object '{target_tag_id}' not found."
+        return md_text, False, f"Target object '{target_tag_id}' not found."
     start_idx, end_idx, canon_id = span
     block = md_text[start_idx:end_idx]
 
     if op == "move":
-        m_pos = re.search(r"(\*\s+\*\*pos\*\*:\s*\[)([^\]]+)(\])", block)
+        m_pos = re.search(r"(\s*[-*+]\s+\*\*pos\*\*:\s*\[)([^\]]+)(\])", block)
         if not m_pos:
             return md_text, False, "Could not parse object pos."
         nums = [_finite_float(x) for x in m_pos.group(2).split(",")]
@@ -1079,12 +1124,19 @@ def mutate_placed_md_snippet(
         return md_text[:start_idx] + new_block + md_text[end_idx:], True, f"Moved [{canon_id}] to ({nx:.2f}, {ny:.2f}, {nz:.2f})."
 
     if op == "rotate":
-        m_rot = re.search(r"(\*\s+\*\*rot\*\*:\s*\[)([^\]]+)(\])", block)
-        if not m_rot:
-            return md_text, False, "Could not parse object rot."
-        nums = [_finite_float(x) for x in m_rot.group(2).split(",")]
-        new_yaw = round((nums[1] + _finite_float(yaw_delta_deg)) % 360.0, 1)
-        new_block = block[: m_rot.start()] + f"{m_rot.group(1)}{nums[0]:.1f}, {new_yaw:.1f}, {nums[2]:.1f}{m_rot.group(3)}" + block[m_rot.end() :]
+        m_rot = re.search(r"(\s*[-*+]\s+\*\*rot\*\*:\s*\[)([^\]]+)(\])", block)
+        if m_rot:
+            nums = [_finite_float(x) for x in m_rot.group(2).split(",")]
+            new_yaw = round((nums[1] + _finite_float(yaw_delta_deg)) % 360.0, 1)
+            new_block = block[: m_rot.start()] + f"{m_rot.group(1)}{nums[0]:.1f}, {new_yaw:.1f}, {nums[2]:.1f}{m_rot.group(3)}" + block[m_rot.end() :]
+        else:
+            m_pos = re.search(r"^(\s*[-*+]\s+\*\*pos\*\*:[^\n]+)$", block, re.M)
+            if not m_pos:
+                return md_text, False, "Could not parse object transform."
+            indent = re.match(r"^(\s*)", m_pos.group(1)).group(1)
+            new_yaw = round(_finite_float(yaw_delta_deg) % 360.0, 1)
+            ins = f"\n{indent}* **rot**: [0.0, {new_yaw:.1f}, 0.0]"
+            new_block = block[: m_pos.end()] + ins + block[m_pos.end() :]
         return md_text[:start_idx] + new_block + md_text[end_idx:], True, f"Rotated [{canon_id}] to yaw {new_yaw:.1f} deg."
 
     if op == "paint" and rgb is not None:
@@ -1102,21 +1154,46 @@ def mutate_placed_md_snippet(
                 new_rad = max(0.5, min(15.0, round(_finite_float(m_pr.group(2), 2.0, 0.5, 15.0) * mult, 2)))
                 new_block = block[: m_pr.start()] + f"{m_pr.group(1)}{new_rad}" + block[m_pr.end() :]
                 return md_text[:start_idx] + new_block + md_text[end_idx:], True, f"Scaled portal [{canon_id}] radius to {new_rad}m."
-        m_sc = re.search(r"(\*\s+\*\*scale\*\*:\s*\[)([^\]]+)(\])", block)
-        if not m_sc:
-            return md_text, False, "Could not parse object scale."
-        nums = [_finite_float(x, 1.0, 0.05, MAX_SCALE_VAL) for x in m_sc.group(2).split(",")]
-        sx = max(0.2, min(20.0, round(nums[0] * mult, 3)))
-        sy = max(0.2, min(20.0, round(nums[1] * mult, 3)))
-        sz = max(0.2, min(20.0, round(nums[2] * mult, 3)))
-        new_block = block[: m_sc.start()] + f"{m_sc.group(1)}{sx:.3f}, {sy:.3f}, {sz:.3f}{m_sc.group(3)}" + block[m_sc.end() :]
+        m_sc = re.search(r"(\s*[-*+]\s+\*\*scale\*\*:\s*\[)([^\]]+)(\])", block)
+        if m_sc:
+            nums = [_finite_float(x, 1.0, 0.05, MAX_SCALE_VAL) for x in m_sc.group(2).split(",")]
+            sx = max(0.2, min(20.0, round(nums[0] * mult, 3)))
+            sy = max(0.2, min(20.0, round(nums[1] * mult, 3)))
+            sz = max(0.2, min(20.0, round(nums[2] * mult, 3)))
+            new_block = block[: m_sc.start()] + f"{m_sc.group(1)}{sx:.3f}, {sy:.3f}, {sz:.3f}{m_sc.group(3)}" + block[m_sc.end() :]
+        else:
+            m_pos = re.search(r"^(\s*[-*+]\s+\*\*pos\*\*:[^\n]+)$", block, re.M)
+            if not m_pos:
+                return md_text, False, "Could not parse object scale."
+            indent = re.match(r"^(\s*)", m_pos.group(1)).group(1)
+            s_val = max(0.2, min(20.0, round(mult, 3)))
+            ins = f"\n{indent}* **scale**: [{s_val:.3f}, {s_val:.3f}, {s_val:.3f}]"
+            new_block = block[: m_pos.end()] + ins + block[m_pos.end() :]
+            sx = s_val
         return md_text[:start_idx] + new_block + md_text[end_idx:], True, f"Scaled [{canon_id}] to {sx:.2f}x."
 
     if op == "clone":
         new_tid = secrets.token_hex(3)
-        cloned = re.sub(rf"PLACED:{re.escape(canon_id)}", f"PLACED:{new_tid}", block, flags=re.I)
-        cloned = re.sub(rf"PLACED_{re.escape(canon_id)}", f"PLACED_{new_tid}", cloned, flags=re.I)
-        m_pos = re.search(r"(\*\s+\*\*pos\*\*:\s*\[)([^\]]+)(\])", cloned)
+        if re.search(r"<!--\s*PLACED:", block, re.I):
+            cloned = re.sub(rf"PLACED:{re.escape(canon_id)}", f"PLACED:{new_tid}", block, flags=re.I)
+            cloned = re.sub(rf"PLACED_{re.escape(canon_id)}", f"PLACED_{new_tid}", cloned, flags=re.I)
+        else:
+            clean_base = re.sub(r"[^a-zA-Z0-9_-]", "", canon_id)[:20] or "Obj"
+            cloned_name = f"{clean_base}_{new_tid}"
+            prop_lines = []
+            for ln in block.splitlines():
+                st_ln = ln.strip()
+                if re.match(r"^[-*+]\s+\*\*", st_ln) and not re.match(r"^[-*+]\s+\*\*(?:pos|position)\*\*", st_ln, re.I):
+                    prop_lines.append(st_ln)
+            pos_m = re.search(r"^\s*[-*+]\s+\*\*(?:pos|position)\*\*:\s*\[[^\]]+\]", block, re.M | re.I)
+            pos_ln = pos_m.group(0).strip() if pos_m else "* **pos**: [0.0, 0.0, 0.0]"
+            cloned = "\n".join([
+                f"<!-- PLACED:{new_tid} by admin -->",
+                f"# Node: PLACED_{new_tid} ({cloned_name})",
+                pos_ln,
+                *prop_lines,
+            ])
+        m_pos = re.search(r"(\s*[-*+]\s+\*\*pos\*\*:\s*\[)([^\]]+)(\])", cloned)
         if m_pos:
             nums = [_finite_float(x) for x in m_pos.group(2).split(",")]
             off_x = _finite_float(dx) if (dx or dy or dz) else 1.5
@@ -1127,7 +1204,6 @@ def mutate_placed_md_snippet(
         return md_text.rstrip() + f"\n\n{cloned}\n", True, f"Cloned [{canon_id}] -> [{new_tid}]."
 
     return md_text, False, f"Unknown op '{op}'."
-
 
 def build_default_hub_md() -> str:
     lines = [
@@ -1206,7 +1282,6 @@ def build_default_hub_md() -> str:
         '* **sign**: { text: "MAKERVERSE NEXUS", color: "#00ffd9", glow: "#006655" }',
     ])
     return "\n".join(lines) + "\n"
-
 
 TEMPLATE_ALIASES = {
     "flat": "flat",
