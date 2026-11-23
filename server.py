@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import socket
+import sys
 import time
 import urllib.parse
 from pathlib import Path
@@ -35,16 +36,180 @@ from mv3d import (
 
 HOST = "0.0.0.0"
 PORT = 8765
-DATA_DIR = Path("./makerverse_data")
+def _resolve_server_data_dir(argv: list[str] | None = None) -> Path:
+    args = sys.argv[1:] if argv is None else argv
+    env_dir = os.environ.get("MAKERVERSE_SERVER_DATA_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    for idx, arg in enumerate(args):
+        if arg == "--data-dir" and idx + 1 < len(args):
+            return Path(args[idx + 1]).expanduser().resolve()
+        if arg.startswith("--data-dir="):
+            return Path(arg.split("=", 1)[1]).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        return (Path(sys.executable).resolve().parent / "makerverse_data").resolve()
+    return (Path(__file__).resolve().parent / "makerverse_data").resolve()
+
+
+DATA_DIR = _resolve_server_data_dir()
+CONFIG_DIR = DATA_DIR / "config"
 WORLDS_DIR = DATA_DIR / "worlds"
 AVATARS_DIR = DATA_DIR / "avatars"
 SERVER_PLUGINS_DIR = DATA_DIR / "plugins"
-PERMS_FILE = DATA_DIR / "permissions.json"
-FRIENDS_FILE = DATA_DIR / "friends.json"
-WORLD_META_FILE = DATA_DIR / "world_meta.json"
-FEDERATION_FILE = DATA_DIR / "federation.json"
+SERVER_CONFIG_FILE = CONFIG_DIR / "server.json"
+PERMS_FILE = CONFIG_DIR / "permissions.json"
+FRIENDS_FILE = CONFIG_DIR / "friends.json"
+WORLD_META_FILE = CONFIG_DIR / "world_meta.json"
+FEDERATION_FILE = CONFIG_DIR / "federation.json"
 BACKUPS_DIR = DATA_DIR / "backups"
 PREFABS_DIR = DATA_DIR / "prefabs"
+
+
+def configure_server_storage(base_dir: Path):
+    global DATA_DIR, CONFIG_DIR, WORLDS_DIR, AVATARS_DIR, SERVER_PLUGINS_DIR
+    global SERVER_CONFIG_FILE, PERMS_FILE, FRIENDS_FILE, WORLD_META_FILE, FEDERATION_FILE
+    global BACKUPS_DIR, PREFABS_DIR
+    DATA_DIR = base_dir.resolve()
+    CONFIG_DIR = DATA_DIR / "config"
+    WORLDS_DIR = DATA_DIR / "worlds"
+    AVATARS_DIR = DATA_DIR / "avatars"
+    SERVER_PLUGINS_DIR = DATA_DIR / "plugins"
+    SERVER_CONFIG_FILE = CONFIG_DIR / "server.json"
+    PERMS_FILE = CONFIG_DIR / "permissions.json"
+    FRIENDS_FILE = CONFIG_DIR / "friends.json"
+    WORLD_META_FILE = CONFIG_DIR / "world_meta.json"
+    FEDERATION_FILE = CONFIG_DIR / "federation.json"
+    BACKUPS_DIR = DATA_DIR / "backups"
+    PREFABS_DIR = DATA_DIR / "prefabs"
+
+
+def migrate_server_layout():
+    if CONFIG_DIR.exists() and not CONFIG_DIR.is_dir():
+        return
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    for fname, dest_fp in (
+        ("permissions.json", PERMS_FILE),
+        ("friends.json", FRIENDS_FILE),
+        ("world_meta.json", WORLD_META_FILE),
+        ("federation.json", FEDERATION_FILE),
+    ):
+        legacy_fp = DATA_DIR / fname
+        if legacy_fp.is_file() and not dest_fp.exists():
+            try:
+                os.replace(legacy_fp, dest_fp)
+                continue
+            except OSError:
+                pass
+            try:
+                _atomic_write_text(dest_fp, legacy_fp.read_text(encoding="utf-8", errors="replace"))
+                legacy_fp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    # Clean up redundant .meta.json sidecar files inside backups/ (metadata already lives in config/world_meta.json)
+    try:
+        if BACKUPS_DIR.exists():
+            for sidecar in BACKUPS_DIR.rglob("*.meta.json"):
+                try:
+                    sidecar.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+DEFAULT_SERVER_CONFIG = {
+    "host": HOST,
+    "port": PORT,
+    "node_name": "Makerverse Node",
+    "node_desc": "Self-Hosted #MV3D Markdown Metaverse Node",
+    "default_role": "builder",
+    "max_players": 0,
+    "max_connections_per_ip": 5,
+    "max_total_worlds": 0,
+    "max_worlds_per_user": 0,
+    "max_world_size_kb": 5120,
+    "max_avatar_size_kb": 512,
+    "max_prefabs_total": 256,
+    "max_auto_backups": 25,
+    "auth_timeout_sec": 10.0,
+}
+
+
+def load_server_config() -> dict:
+    raw = _read_json_safe(SERVER_CONFIG_FILE, DEFAULT_SERVER_CONFIG)
+    cfg = dict(DEFAULT_SERVER_CONFIG)
+    if isinstance(raw, dict):
+        host_v = str(raw.get("host", cfg["host"]) or "").strip()
+        if host_v and len(host_v) <= 128 and not any(ch in host_v for ch in ("\n", "\r", "\x00", " ")):
+            cfg["host"] = host_v
+        if _is_strict_int(raw.get("port")) and 1 <= int(raw["port"]) <= 65535:
+            cfg["port"] = int(raw["port"])
+        n_name = re.sub(r"[\x00-\x1f\x7f]", " ", str(raw.get("node_name", cfg["node_name"]))).strip()[:48]
+        if n_name:
+            cfg["node_name"] = n_name
+        n_desc = re.sub(r"[\x00-\x1f\x7f]", " ", str(raw.get("node_desc", cfg["node_desc"]))).strip()[:160]
+        if n_desc:
+            cfg["node_desc"] = n_desc
+        d_role = str(raw.get("default_role", cfg["default_role"]) or "").strip().lower()
+        if d_role in ("guest", "builder"):
+            cfg["default_role"] = d_role
+        for int_key, lo_v, hi_v in (
+            ("max_players", 0, 100000),
+            ("max_connections_per_ip", 1, 1000),
+            ("max_total_worlds", 0, 100000),
+            ("max_worlds_per_user", 0, 100000),
+            ("max_world_size_kb", 64, 65536),
+            ("max_avatar_size_kb", 16, 8192),
+            ("max_prefabs_total", 1, 10000),
+            ("max_auto_backups", 1, 500),
+        ):
+            if _is_strict_int(raw.get(int_key)):
+                cfg[int_key] = max(lo_v, min(hi_v, int(raw[int_key])))
+        if _is_finite_num(raw.get("auth_timeout_sec")):
+            cfg["auth_timeout_sec"] = max(3.0, min(120.0, float(raw["auth_timeout_sec"])))
+    if raw != cfg:
+        _atomic_write_text(SERVER_CONFIG_FILE, json.dumps(cfg, indent=2))
+    return cfg
+
+
+def save_server_config(updates: dict) -> dict:
+    cfg = load_server_config()
+    cfg.update(updates)
+    _atomic_write_text(SERVER_CONFIG_FILE, json.dumps(cfg, indent=2))
+    return load_server_config()
+
+
+def get_runtime_server_config() -> dict:
+    cfg = load_server_config()
+    if PERMS_FILE.exists():
+        perms = _read_json_safe(PERMS_FILE, {})
+        if isinstance(perms, dict):
+            p_changed = False
+            for k_sync in ("default_role", "max_total_worlds", "max_worlds_per_user"):
+                if perms.get(k_sync) != cfg[k_sync]:
+                    perms[k_sync] = cfg[k_sync]
+                    p_changed = True
+            if p_changed:
+                _atomic_write_text(PERMS_FILE, json.dumps(perms, indent=2))
+    return cfg
+
+
+def apply_runtime_server_config(cfg: dict | None = None) -> dict:
+    global HOST, PORT, MAX_FILE_SIZE, MAX_AVATAR_SIZE, MAX_AUTO_BACKUPS
+    global AUTH_TIMEOUT_SEC, MAX_CONNECTIONS_PER_IP, MAX_PREFABS_TOTAL
+    eff = cfg if cfg is not None else get_runtime_server_config()
+    HOST = eff["host"]
+    PORT = eff["port"]
+    MAX_FILE_SIZE = int(eff["max_world_size_kb"]) * 1024
+    MAX_AVATAR_SIZE = int(eff["max_avatar_size_kb"]) * 1024
+    MAX_AUTO_BACKUPS = int(eff["max_auto_backups"])
+    AUTH_TIMEOUT_SEC = float(eff["auth_timeout_sec"])
+    MAX_CONNECTIONS_PER_IP = int(eff["max_connections_per_ip"])
+    MAX_PREFABS_TOTAL = int(eff["max_prefabs_total"])
+    return eff
+
 MAX_PREFAB_SIZE = 256 * 1024
 
 MAX_FILE_SIZE = 5 * 1024 * 1024
@@ -262,13 +427,18 @@ def get_world_spawn(world_name: str, w_entry: dict) -> tuple[list[float], float]
 
 
 def load_federation() -> dict:
+    scfg = load_server_config()
     data = _read_json_safe(FEDERATION_FILE, {
-        "node_name": "Makerverse Node",
-        "node_desc": "Self-Hosted #MV3D Markdown Metaverse Node",
+        "node_name": scfg["node_name"],
+        "node_desc": scfg["node_desc"],
         "peers": {},
     })
-    data.setdefault("node_name", "Makerverse Node")
-    data.setdefault("node_desc", "Self-Hosted #MV3D Markdown Metaverse Node")
+    if data.get("node_name") in (None, "", "Makerverse Node") and scfg["node_name"] != "Makerverse Node":
+        data["node_name"] = scfg["node_name"]
+    if data.get("node_desc") in (None, "", "Self-Hosted #MV3D Markdown Metaverse Node") and scfg["node_desc"] != "Self-Hosted #MV3D Markdown Metaverse Node":
+        data["node_desc"] = scfg["node_desc"]
+    data.setdefault("node_name", scfg["node_name"])
+    data.setdefault("node_desc", scfg["node_desc"])
     data.setdefault("peers", {})
     return data
 
@@ -295,12 +465,10 @@ def create_world_snapshot(world_name: str, label: str = "") -> str | None:
         snap_md = w_backup_dir / f"{base_stem}_{counter}.md"
         counter += 1
     _atomic_write_text(snap_md, read_md_safe(md_path))
-    _atomic_write_text(snap_md.with_suffix(".meta.json"), json.dumps(load_world_meta().get(safe_world, {}), indent=2))
     if clean_lbl == "auto":
         for old_md in sorted(w_backup_dir.glob("*_auto*.md"), reverse=True)[MAX_AUTO_BACKUPS:]:
             try:
                 old_md.unlink(missing_ok=True)
-                old_md.with_suffix(".meta.json").unlink(missing_ok=True)
             except Exception:
                 pass
     return snap_md.name
@@ -362,24 +530,25 @@ def load_server_plugins() -> dict:
 
 
 def load_perms():
+    scfg = load_server_config()
     perms = _read_json_safe(PERMS_FILE, {
-        "default_role": "builder",
+        "default_role": scfg["default_role"],
         "admins": [],
         "builders": [],
         "banned": [],
-        "max_total_worlds": 0,
-        "max_worlds_per_user": 0,
+        "max_total_worlds": scfg["max_total_worlds"],
+        "max_worlds_per_user": scfg["max_worlds_per_user"],
         "user_avatars": {},
         "avatar_owners": {},
         "nick_registry": {},
     })
     for k, dv in (
-        ("default_role", "builder"),
+        ("default_role", scfg["default_role"]),
         ("admins", []),
         ("builders", []),
         ("banned", []),
-        ("max_total_worlds", 0),
-        ("max_worlds_per_user", 0),
+        ("max_total_worlds", scfg["max_total_worlds"]),
+        ("max_worlds_per_user", scfg["max_worlds_per_user"]),
         ("user_avatars", {}),
         ("avatar_owners", {}),
         ("nick_registry", {}),
@@ -865,6 +1034,7 @@ async def handler(websocket):
                     "node_name": fed.get("node_name", "Makerverse Node"),
                     "node_desc": fed.get("node_desc", ""),
                     "online_count": len(CLIENTS),
+                    "max_players": int(get_runtime_server_config().get("max_players", 0) or 0),
                     "worlds": worlds_list,
                     "peers": [
                         {"url": u, "label": m.get("label", u), "default_world": m.get("default_world", "hub")}
@@ -896,6 +1066,17 @@ async def handler(websocket):
                 role = get_role(pubkey_hex)
                 if role == "banned":
                     await websocket.send(json.dumps({"type": "error", "msg": "Key is banned from this server."}))
+                    await websocket.close(code=1008)
+                    return
+
+                rt_cfg = apply_runtime_server_config()
+                max_players = int(rt_cfg.get("max_players", 0) or 0)
+                active_other_players = sum(
+                    1 for ws_c, st_c in CLIENTS.items()
+                    if ws_c != websocket and st_c.get("pubkey") != pubkey_hex
+                )
+                if max_players > 0 and role != "admin" and active_other_players >= max_players:
+                    await websocket.send(json.dumps({"type": "error", "msg": f"Server is full ({active_other_players}/{max_players} players online)."}))
                     await websocket.close(code=1008)
                     return
 
@@ -1458,7 +1639,6 @@ async def handler(websocket):
                         restored_md = read_md_safe(latest)
                         _atomic_write_text(md_path, restored_md)
                         latest.unlink(missing_ok=True)
-                        latest.with_suffix(".meta.json").unlink(missing_ok=True)
                         parsed_undo = parse_mv3d(restored_md)
                         if parsed_undo.get("spawn_pos") is not None:
                             w_entry["spawn_pos"] = list(parsed_undo["spawn_pos"])
@@ -1503,9 +1683,10 @@ async def handler(websocket):
                             await websocket.send(json.dumps({"type": "error", "msg": f"Access denied on '{name}'."}))
                             continue
                         if is_new and client_state["role"] != "admin":
+                            rt_cfg = apply_runtime_server_config()
                             perms = load_perms()
-                            max_total = int(perms.get("max_total_worlds", 0) or 0)
-                            max_per_user = int(perms.get("max_worlds_per_user", 0) or 0)
+                            max_total = int(rt_cfg.get("max_total_worlds", perms.get("max_total_worlds", 0)) or 0)
+                            max_per_user = int(rt_cfg.get("max_worlds_per_user", perms.get("max_worlds_per_user", 0)) or 0)
                             all_custom = [f.stem for f in WORLDS_DIR.glob("*.md") if f.stem.lower() != "hub"]
                             if max_total > 0 and len(all_custom) >= max_total:
                                 await websocket.send(json.dumps({"type": "error", "msg": "Server world limit reached."}))
@@ -1697,9 +1878,12 @@ async def handler(websocket):
                             perms["banned"] = [k for k in perms["banned"] if k != target_key]
                     elif action == "set_default" and target_key in ("guest", "builder"):
                         perms["default_role"] = target_key
+                        save_server_config({"default_role": target_key})
                     elif action in ("set_max_worlds", "set_user_world_limit") and _is_strict_int(data.get("limit")):
                         val = max(0, min(100000, int(data["limit"])))
-                        perms["max_total_worlds" if action == "set_max_worlds" else "max_worlds_per_user"] = val
+                        cfg_k = "max_total_worlds" if action == "set_max_worlds" else "max_worlds_per_user"
+                        perms[cfg_k] = val
+                        save_server_config({cfg_k: val})
                     else:
                         await websocket.send(json.dumps({"type": "error", "msg": "Invalid permission command."}))
                         continue
@@ -2120,6 +2304,7 @@ async def handler(websocket):
                     continue
 
                 if action == "save":
+                    apply_runtime_server_config()
                     p_name = sanitize_name(str(data.get("name", "")))
                     if not p_name:
                         await websocket.send(json.dumps({"type": "error", "msg": "Specify a valid blueprint name."}))
@@ -2215,16 +2400,49 @@ async def handler(websocket):
 
 
 async def main():
-    for d in (DATA_DIR, WORLDS_DIR, AVATARS_DIR, BACKUPS_DIR, PREFABS_DIR, SERVER_PLUGINS_DIR):
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        print(
+            "Makerverse #MV3D Server\n"
+            "Usage: python server.py [--data-dir PATH] [--host ADDR] [--port PORT]"
+        )
+        return
+    configure_server_storage(_resolve_server_data_dir(sys.argv[1:]))
+    for d in (DATA_DIR, CONFIG_DIR, WORLDS_DIR, AVATARS_DIR, BACKUPS_DIR, PREFABS_DIR, SERVER_PLUGINS_DIR):
         d.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(d, 0o700)
         except OSError:
             pass
+    migrate_server_layout()
+    eff_cfg = apply_runtime_server_config()
+    args_iter = iter(sys.argv[1:])
+    for tok in args_iter:
+        if tok == "--host":
+            h_v = next(args_iter, "").strip()
+            if h_v:
+                eff_cfg["host"] = h_v
+        elif tok.startswith("--host="):
+            h_v = tok.split("=", 1)[1].strip()
+            if h_v:
+                eff_cfg["host"] = h_v
+        elif tok == "--port":
+            p_v = next(args_iter, "").strip()
+            if p_v.isdigit() and 1 <= int(p_v) <= 65535:
+                eff_cfg["port"] = int(p_v)
+        elif tok.startswith("--port="):
+            p_v = tok.split("=", 1)[1].strip()
+            if p_v.isdigit() and 1 <= int(p_v) <= 65535:
+                eff_cfg["port"] = int(p_v)
+    apply_runtime_server_config(eff_cfg)
     load_server_plugins()
     ensure_hub_world()
     load_perms()
-    print(f"[*] Makerverse (#MV3D) v2 Server running on ws://{HOST}:{PORT}")
+    load_friends()
+    load_world_meta()
+    load_federation()
+    mp_lbl = eff_cfg["max_players"] if eff_cfg["max_players"] > 0 else "unlimited"
+    mw_lbl = eff_cfg["max_total_worlds"] if eff_cfg["max_total_worlds"] > 0 else "unlimited"
+    print(f"[*] Makerverse (#MV3D) v2 Server running on ws://{HOST}:{PORT} (data: {DATA_DIR}, max_players={mp_lbl}, max_worlds={mw_lbl})")
     async with websockets.serve(handler, HOST, PORT, max_size=MAX_FILE_SIZE + 65536, ping_interval=20, ping_timeout=20):
         await asyncio.Future()
 
