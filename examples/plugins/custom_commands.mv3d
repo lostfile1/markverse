@@ -1,0 +1,14 @@
+# Example Server Plugin (copy to makerverse_data/plugins/custom_commands.mv3d)
+COMMAND: /beacon
+DESC: Spawn a tall magenta beacon tower in front of you
+ROLE: builder
+ACTION: spawn_md
+VALUE: # Node: BeaconTower
+* **pos**: [{x}, 3.0, {z_front}]
+* **cylinder**: {{ radius: 0.35, height: 6.0, color: "#ff26bf", glow: "#990066" }}
+---
+COMMAND: /motd
+DESC: Broadcast a welcome message to all connected players
+ROLE: admin
+ACTION: broadcast
+VALUE: [MOTD] Welcome to {world}, {nick}! {args}
