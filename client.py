@@ -14,17 +14,35 @@ import sys
 import threading
 import time
 import urllib.parse
+import webbrowser
 from pathlib import Path
 
 import numpy as np
-import pygame
-from pygame.locals import *
-from OpenGL.GL import *
-from OpenGL.GL import shaders
-import websockets
 from nacl.signing import SigningKey
 
+try:
+    import pygame
+    from pygame.locals import *
+except Exception:
+    pygame = None
+
+try:
+    from OpenGL.GL import *
+    from OpenGL.GL import shaders
+except Exception:
+    GL_TRIANGLES = 4
+    GL_LINES = 1
+    GL_VERTEX_SHADER = 35633
+    GL_FRAGMENT_SHADER = 35632
+    shaders = None
+
+try:
+    import websockets
+except Exception:
+    websockets = None
+
 from mv3d import (
+    _finite_int,
     PLACED_SHAPES,
     RESERVED_ROLE_LABELS,
     WORLD_TEMPLATES,
@@ -35,6 +53,7 @@ from mv3d import (
     resolve_world_template_match,
     compute_md_sha256,
     format_rank_prefix,
+    is_safe_media_url,
     get_rank_badge_color,
     normalize_role_name,
     normalize_expression_name,
@@ -75,6 +94,7 @@ KEY_FILE = CLIENT_DATA_DIR / "identity.key.hex"
 PROFILE_CACHE_FILE = CLIENT_DATA_DIR / "profile.json"
 SERVERS_FILE = CLIENT_DATA_DIR / "servers.json"
 BLOCKED_FILE = CLIENT_DATA_DIR / "blocked.json"
+WAYPOINTS_FILE = CLIENT_DATA_DIR / "waypoints.json"
 WORLD_CACHE_DIR = CLIENT_DATA_DIR / "cache" / "worlds"
 AVATAR_CACHE_DIR = CLIENT_DATA_DIR / "cache" / "avatars"
 PREFAB_CACHE_DIR = CLIENT_DATA_DIR / "cache" / "prefabs"
@@ -83,7 +103,7 @@ DEFAULT_SERVER = os.environ.get("MAKERVERSE_SERVER", "ws://localhost:8765").stri
 
 
 def configure_client_storage(base_dir: Path):
-    global CLIENT_DATA_DIR, KEY_FILE, PROFILE_CACHE_FILE, SERVERS_FILE, BLOCKED_FILE
+    global CLIENT_DATA_DIR, KEY_FILE, PROFILE_CACHE_FILE, SERVERS_FILE, BLOCKED_FILE, WAYPOINTS_FILE
     global WORLD_CACHE_DIR, AVATAR_CACHE_DIR, PREFAB_CACHE_DIR, EXPORTS_DIR
     if base_dir.exists() and not base_dir.is_dir():
         base_dir = Path.home() / ".makerverse"
@@ -92,6 +112,7 @@ def configure_client_storage(base_dir: Path):
     PROFILE_CACHE_FILE = CLIENT_DATA_DIR / "profile.json"
     SERVERS_FILE = CLIENT_DATA_DIR / "servers.json"
     BLOCKED_FILE = CLIENT_DATA_DIR / "blocked.json"
+    WAYPOINTS_FILE = CLIENT_DATA_DIR / "waypoints.json"
     WORLD_CACHE_DIR = CLIENT_DATA_DIR / "cache" / "worlds"
     AVATAR_CACHE_DIR = CLIENT_DATA_DIR / "cache" / "avatars"
     PREFAB_CACHE_DIR = CLIENT_DATA_DIR / "cache" / "prefabs"
@@ -503,6 +524,38 @@ class ModernRenderer:
         glDrawArrays(GL_TRIANGLES, 0, 6)
         glBindVertexArray(0)
 
+    def draw_frame_2d(
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        fill_rgba: tuple[float, float, float, float],
+        border_rgba: tuple[float, float, float, float] = (0.0, 1.0, 0.80, 0.45),
+        accent_rgba: tuple[float, float, float, float] = (1.0, 0.40, 0.80, 0.85),
+        border_px: float = 1.0,
+        corner_len: float = 10.0,
+    ):
+        w = max(0.0, float(w))
+        h = max(0.0, float(h))
+        if w <= 0.0 or h <= 0.0:
+            return
+        self.draw_rect_2d(x, y, w, h, fill_rgba)
+        b = min(max(1.0, float(border_px)), w * 0.5, h * 0.5)
+        if border_rgba[3] > 0.0:
+            self.draw_rect_2d(x, y, w, b, border_rgba)
+            self.draw_rect_2d(x, y + h - b, w, b, border_rgba)
+            self.draw_rect_2d(x, y + b, b, max(0.0, h - 2.0 * b), border_rgba)
+            self.draw_rect_2d(x + w - b, y + b, b, max(0.0, h - 2.0 * b), border_rgba)
+        clen = min(max(3.0, float(corner_len)), w * 0.35, h * 0.35)
+        ct = min(max(1.5, b + 1.0), clen)
+        if accent_rgba[3] > 0.0 and clen >= 3.0:
+            # Top-left & bottom-right neon corner brackets
+            self.draw_rect_2d(x, y, clen, ct, accent_rgba)
+            self.draw_rect_2d(x, y, ct, clen, accent_rgba)
+            self.draw_rect_2d(x + w - clen, y + h - ct, clen, ct, accent_rgba)
+            self.draw_rect_2d(x + w - ct, y + h - clen, ct, clen, accent_rgba)
+
     def draw_text_2d(self, font, x: float, y: float, text: str, color=(0, 255, 204)):
         if not text:
             return
@@ -580,6 +633,21 @@ def get_object_aabb(obj: dict) -> tuple[float, float, float, float, float, float
             min(px + p[0] * sx for p in obj["pts"]), max(px + p[0] * sx for p in obj["pts"]),
             min(py + p[1] * sy for p in obj["pts"]), max(py + p[1] * sy for p in obj["pts"]),
             min(pz + p[2] * sz for p in obj["pts"]), max(pz + p[2] * sz for p in obj["pts"]),
+        )
+    if kind == "grid":
+        xd = max(2, int(obj.get("xd", 2)))
+        zd = max(2, int(obj.get("zd", 2)))
+        xs = float(obj.get("xs", 1.0))
+        zs = float(obj.get("zs", 1.0))
+        hs = obj.get("heights") or [0.0]
+        min_h = min(hs) if hs else 0.0
+        max_h = max(hs) if hs else 0.0
+        span_x = (xd - 1) * xs * sx
+        span_z = (zd - 1) * zs * sz
+        return (
+            min(px, px + span_x), max(px, px + span_x),
+            py + min_h * sy - 0.1, py + max_h * sy + 0.1,
+            min(pz, pz + span_z), max(pz, pz + span_z),
         )
     return None
 
@@ -707,8 +775,9 @@ def step_player_physics(cam_pos, dx, dz, vel_y, jump_pressed, dt, spatial_hash: 
     ground_y = 0.0
     for min_x, max_x, min_y, max_y, min_z, max_z in nearby:
         if cam_pos[0] + radius > min_x and cam_pos[0] - radius < max_x and cam_pos[2] + radius > min_z and cam_pos[2] - radius < max_z:
-            if ground_y < max_y <= feet_y + step_height:
-                ground_y = max_y
+            if max_y <= feet_y + step_height or (vel_y <= 0.0 and orig_feet_y >= max_y - 0.05):
+                if max_y > ground_y:
+                    ground_y = max_y
 
     if feet_y <= ground_y + 0.03 and vel_y <= 0.0:
         feet_y = ground_y
@@ -908,10 +977,217 @@ def save_blocked_users(blocked: set[str]):
     _write_secure_file(BLOCKED_FILE, json.dumps(sorted(blocked), indent=2))
 
 
+def _wp_scope_key(server_url: str, world_name: str) -> str:
+    s_norm = normalize_ws_url(server_url) or str(server_url or "ws://localhost:8765").strip()
+    w_norm = _clean_ident(world_name, 32, "hub")
+    return f"{s_norm}::{w_norm}"
+
+
+def load_scoped_waypoints(server_url: str, world_name: str) -> dict[str, list[float]]:
+    if not WAYPOINTS_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(WAYPOINTS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        scoped = raw.get(_wp_scope_key(server_url, world_name), {})
+        if not isinstance(scoped, dict):
+            return {}
+        out: dict[str, list[float]] = {}
+        for k, v in list(scoped.items())[:64]:
+            wk = _clean_ident(k, 24, "")
+            if wk and isinstance(v, list) and len(v) >= 3:
+                try:
+                    coords = [
+                        max(-500.0, min(500.0, float(v[0]))),
+                        max(-100.0, min(500.0, float(v[1]))),
+                        max(-500.0, min(500.0, float(v[2]))),
+                    ]
+                    if all(math.isfinite(c) for c in coords):
+                        out[wk] = coords
+                except (TypeError, ValueError):
+                    pass
+        return out
+    except Exception:
+        return {}
+
+
+def save_scoped_waypoints(server_url: str, world_name: str, wps: dict[str, list[float]]):
+    all_data: dict = {}
+    if WAYPOINTS_FILE.exists():
+        try:
+            loaded = json.loads(WAYPOINTS_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                all_data = loaded
+        except Exception:
+            all_data = {}
+    key = _wp_scope_key(server_url, world_name)
+    if wps:
+        all_data[key] = wps
+    else:
+        all_data.pop(key, None)
+    _write_secure_file(WAYPOINTS_FILE, json.dumps(all_data, indent=2))
+
+
 def store_cached_prefab_md(name: str, md_text: str):
     clean_n = _clean_ident(name, 32)
     if clean_n and md_text:
         _write_secure_file(PREFAB_CACHE_DIR / f"{clean_n}.md", md_text)
+
+
+import base64
+
+try:
+    import sounddevice as _sd
+except Exception:
+    _sd = None
+
+
+class VoiceChat:
+    """Optional Push-to-Talk voice chat using PCM16 mono chunks over WebSocket."""
+    def __init__(self, send_cb, log_cb, sample_rate: int = 16000):
+        self.send_cb = send_cb
+        self.log_cb = log_cb
+        self.sr = sample_rate
+        self.enabled = False
+        self.ptt_active = False
+        self._in_stream = None
+        self._out_stream = None
+        self._out_sr = sample_rate
+        self._warned_no_sd = False
+        self._lock = threading.Lock()
+
+    def toggle(self) -> bool:
+        if _sd is None:
+            self.enabled = False
+            if not self._warned_no_sd:
+                self._warned_no_sd = True
+                self.log_cb("VOICE", "#ffaa00", "Voice chat requires 'sounddevice' (pip install sounddevice).")
+            else:
+                self.log_cb("VOICE", "#ffaa00", "Voice unavailable: 'sounddevice' not installed.")
+            return False
+        with self._lock:
+            self.enabled = not self.enabled
+            now_en = self.enabled
+        if now_en:
+            self._ensure_streams(self.sr)
+            self.log_cb("VOICE", "#00ff66", "Voice chat ON (hold Left/Right Alt to talk; /voice to toggle).")
+        else:
+            self.set_ptt(False)
+            self.stop()
+            self.log_cb("VOICE", "#ffaa00", "Voice chat OFF.")
+        return now_en
+
+    def _ensure_streams(self, target_sr: int | None = None):
+        if _sd is None:
+            return
+        want_sr = int(target_sr or self.sr or 16000)
+        with self._lock:
+            if not self.enabled:
+                return
+            if self._out_stream is not None and self._out_sr != want_sr:
+                try:
+                    self._out_stream.stop()
+                    self._out_stream.close()
+                except Exception:
+                    pass
+                self._out_stream = None
+            if self._out_stream is None:
+                try:
+                    st_out = _sd.OutputStream(samplerate=want_sr, channels=1, dtype="int16", blocksize=1600)
+                    st_out.start()
+                    self._out_stream = st_out
+                    self._out_sr = want_sr
+                except Exception as exc:
+                    self._out_stream = None
+                    self.log_cb("VOICE-ERR", "#ff4444", f"Speaker init failed: {exc}")
+
+    def set_ptt(self, active: bool):
+        with self._lock:
+            if not self.enabled or _sd is None:
+                self.ptt_active = False
+                return
+            active = bool(active)
+            if active and not self.ptt_active:
+                self.ptt_active = True
+                need_in = self._in_stream is None
+            elif not active and self.ptt_active:
+                self.ptt_active = False
+                return
+            else:
+                return
+
+        self._ensure_streams(self.sr)
+        if need_in:
+            def _on_audio(indata, frames, time_info, status):
+                if not self.enabled or not self.ptt_active:
+                    return
+                try:
+                    raw_b = bytes(indata)
+                    if raw_b:
+                        self.send_cb({
+                            "type": "voice",
+                            "sr": self.sr,
+                            "pcm_b64": base64.b64encode(raw_b).decode("ascii"),
+                        })
+                except Exception:
+                    pass
+            try:
+                st_in = _sd.InputStream(
+                    samplerate=self.sr, channels=1, dtype="int16", blocksize=1600, callback=_on_audio
+                )
+                st_in.start()
+                with self._lock:
+                    if not self.enabled:
+                        st_in.stop()
+                        st_in.close()
+                    else:
+                        self._in_stream = st_in
+            except Exception as exc:
+                with self._lock:
+                    self._in_stream = None
+                    self.ptt_active = False
+                self.log_cb("VOICE-ERR", "#ff4444", f"Mic init failed: {exc}")
+
+    def play_packet(self, pcm_b64: str, sr: int = 16000, gain: float = 1.0):
+        if not self.enabled or _sd is None or not pcm_b64:
+            return
+        g_val = max(0.0, min(1.5, float(gain)))
+        if g_val <= 0.01:
+            return
+        play_sr = max(8000, min(48000, int(sr or 16000)))
+        self._ensure_streams(play_sr)
+        try:
+            raw = base64.b64decode(pcm_b64, validate=True)
+            if not raw or len(raw) > 131072 or (len(raw) % 2) != 0:
+                return
+            arr = np.frombuffer(raw, dtype="<i2")
+            if arr.size <= 0:
+                return
+            if abs(g_val - 1.0) > 1e-3:
+                scaled = np.clip(arr.astype(np.float32) * g_val, -32768.0, 32767.0).astype("<i2")
+            else:
+                scaled = arr
+            with self._lock:
+                out_s = self._out_stream
+                if out_s is None or not self.enabled:
+                    return
+                out_s.write(scaled.reshape(-1, 1))
+        except Exception:
+            pass
+
+    def stop(self):
+        with self._lock:
+            self.ptt_active = False
+            in_s, self._in_stream = self._in_stream, None
+            out_s, self._out_stream = self._out_stream, None
+        for st in (in_s, out_s):
+            if st is not None:
+                try:
+                    st.stop()
+                    st.close()
+                except Exception:
+                    pass
 
 
 class RadioPlayer:
@@ -1027,6 +1303,9 @@ class MakerverseClient:
         self.peers = {}
         self.media_states: dict[str, dict] = {}
         self.radio = RadioPlayer()
+        self.voice = VoiceChat(self.send_json, self.log)
+        self.last_del_shortcut_at = 0.0
+        self.last_nudge_at = 0.0
         self.fly_mode = False
         self.inspect_mode = False
         self.grid_snap = 0.0
@@ -1051,6 +1330,7 @@ class MakerverseClient:
         self.chat_log = [("SYSTEM", "#00ffcc", "Makerverse #MV3D v2 Ready. Press [T] or [/] or /help.")]
         self.prev_server = None
         self.reconnect_target = None
+        self.pending_hop_origin = None
         self.active_ws = None
         self._connect_task = None
         self.out_queue = asyncio.Queue()
@@ -1129,12 +1409,15 @@ class MakerverseClient:
             self.chat_log.pop(0)
 
     def send_json(self, payload: dict):
+        ptype = payload.get("type")
         if self.loop and not self.loop.is_closed() and self.connected:
+            if ptype == "voice" and (not self.short_id or self.out_queue.qsize() > 24):
+                return
             try:
                 self.loop.call_soon_threadsafe(self.out_queue.put_nowait, json.dumps(payload))
             except RuntimeError:
                 pass
-        elif payload.get("type") not in ("get_avatar", "move"):
+        elif ptype not in ("get_avatar", "move", "voice"):
             self.log("NET", "#ffaa00", "Not connected to server yet; action skipped.")
 
     def _store_avatar_mesh(self, av_name: str, mesh: dict, md_text: str = ""):
@@ -1163,7 +1446,29 @@ class MakerverseClient:
         self.avatar_requested[av_name] = now
         self.send_json({"type": "get_avatar", "name": av_name})
 
-    def _apply_world(self, world_name: str, md_text: str, desc: str = "", radio_url: str = "", radio_name: str = "", spawn_pos=None, spawn_yaw: float = 0.0, in_place: bool = False):
+    def _apply_persistent_triggers(self, active_triggers: dict | None):
+        if not isinstance(active_triggers, dict) or not active_triggers:
+            return
+        norm_map = {
+            _clean_ident(str(k), 32, "").lower(): bool(v)
+            for k, v in active_triggers.items()
+            if isinstance(v, bool) and _clean_ident(str(k), 32, "")
+        }
+        restored_count = 0
+        for trig in self.scene.get("triggers", []):
+            tid = str(trig.get("id", "")).strip()
+            if not tid:
+                continue
+            if norm_map.get(tid.lower(), False) is True:
+                if trig.get("mode", "once") == "once":
+                    self.triggered_ids.add(tid)
+                if not self.trigger_toggled_state.get(tid, False):
+                    self._set_trigger_visual_state(trig, True)
+                    restored_count += 1
+        if restored_count > 0:
+            self.log("STATE", "#00ffcc", f"Restored {restored_count} persistent trigger state(s) in '{self.world}'.")
+
+    def _apply_world(self, world_name: str, md_text: str, desc: str = "", radio_url: str = "", radio_name: str = "", spawn_pos=None, spawn_yaw: float = 0.0, in_place: bool = False, active_triggers: dict | None = None):
         self.world = world_name
         self.scene = parse_mv3d(md_text)
         self.spatial_hash.rebuild(self.scene.get("objects", []))
@@ -1176,6 +1481,7 @@ class MakerverseClient:
         self.world_desc = desc or self.scene.get("world_info_desc", "")
         store_cached_world(world_name, md_text)
         self.radio.set_stream(radio_url or self.scene.get("radio_url", ""), radio_name or self.scene.get("radio_name", ""))
+        self._apply_persistent_triggers(active_triggers)
         if in_place:
             return
         self.portal_cooldown_until = time.time() + 2.0
@@ -1188,21 +1494,10 @@ class MakerverseClient:
         else:
             self.teleport_req = [0.0, 4.05, 13.5] if world_name.lower() == "hub" else [0.0, 2.2, 12.0]
             self.teleport_yaw = 0.0
+        self.waypoints = load_scoped_waypoints(self.server_url, world_name)
 
-    def apply_trigger(self, trig: dict, now: float = 0.0):
-        tid = trig["id"]
-        mode = trig.get("mode", "once")
-        if mode == "once":
-            if tid in self.triggered_ids:
-                return
-            self.triggered_ids.add(tid)
-        else:
-            if now < self.trigger_cooldowns.get(tid, 0.0):
-                return
-            self.trigger_cooldowns[tid] = now + float(trig.get("cooldown", 1.5))
-
-        is_active = not self.trigger_toggled_state.get(tid, False)
-        self.trigger_toggled_state[tid] = is_active
+    def _set_trigger_visual_state(self, trig: dict, is_active: bool) -> int:
+        self.trigger_toggled_state[trig["id"]] = is_active
         t_name = trig.get("target", "")
         act = trig.get("action", "toggle_glow")
         matched = [
@@ -1227,12 +1522,59 @@ class MakerverseClient:
                 px, py, pz = o["pos"]
                 o["pos"] = (px + ox * sign, py + oy * sign, pz + oz * sign)
         self.spatial_hash.rebuild(self.scene.get("objects", []))
+        return len(matched)
+
+    def apply_trigger(self, trig: dict, now: float = 0.0, broadcast: bool = True):
+        tid = trig["id"]
+        mode = trig.get("mode", "once")
+        if mode == "once":
+            if tid in self.triggered_ids:
+                return
+            self.triggered_ids.add(tid)
+        else:
+            if now < self.trigger_cooldowns.get(tid, 0.0):
+                return
+            self.trigger_cooldowns[tid] = now + float(trig.get("cooldown", 1.5))
+
+        is_active = not self.trigger_toggled_state.get(tid, False)
+        n_matched = self._set_trigger_visual_state(trig, is_active)
+        if broadcast and self.connected:
+            self.send_json({"type": "trigger_sync", "trigger_id": tid, "active": is_active})
         state_lbl = "ON" if is_active else "OFF"
-        self.log("TRIGGER", "#ffaa00", f"Activated '{tid}' [{state_lbl}] ({act}) on {len(matched)} object(s).")
+        self.log("TRIGGER", "#ffaa00", f"Activated '{tid}' [{state_lbl}] ({trig.get('action', 'toggle_glow')}) on {n_matched} object(s).")
+
+    def apply_remote_trigger_sync(self, trig_id: str, active: bool):
+        for trig in self.scene.get("triggers", []):
+            if trig.get("id", "").lower() == trig_id.lower():
+                if bool(self.trigger_toggled_state.get(trig["id"], False)) != bool(active):
+                    if trig.get("mode", "once") == "once" and active:
+                        self.triggered_ids.add(trig["id"])
+                    self._set_trigger_visual_state(trig, bool(active))
+                break
+
+    def _activate_media_screen(self, media_spec: dict):
+        raw_u = str(media_spec.get("url") or media_spec.get("embed_url") or "").strip()
+        ok_u, err_u = is_safe_media_url(raw_u, allow_unresolvable=True)
+        if not ok_u:
+            self.log("MEDIA-ERR", "#ff4444", err_u or "Invalid media screen URL.")
+            return
+        _set_clipboard_text(raw_u)
+        title_s = str(media_spec.get("title") or media_spec.get("id") or "Media").strip()
+        try:
+            webbrowser.open(raw_u, new=2)
+            self.log("MEDIA", "#00ff66", f"Opened '{title_s}' in browser (URL copied): {raw_u}")
+        except Exception as exc:
+            self.log("MEDIA", "#ffaa00", f"Copied '{title_s}' URL to clipboard ({exc}): {raw_u}")
+        scr_id = str(media_spec.get("id") or "").strip()
+        if scr_id and self.connected:
+            self.send_json({"type": "media_sync", "screen_id": scr_id, "paused": False, "muted": False, "scroll_y": 0})
 
     def trigger_interact(self, now: float):
         if self.nearby_interact_target is not None:
-            self.apply_trigger(self.nearby_interact_target, now=now)
+            if isinstance(self.nearby_interact_target, dict) and "_media_screen" in self.nearby_interact_target:
+                self._activate_media_screen(self.nearby_interact_target["_media_screen"])
+            else:
+                self.apply_trigger(self.nearby_interact_target, now=now)
 
     def check_portals_and_triggers(self, cam_pos: list[float], now: float):
         self.nearby_interact_prompt = ""
@@ -1251,6 +1593,19 @@ class MakerverseClient:
                         self.nearby_interact_prompt = f"[F] {lbl}"
                 else:
                     self.apply_trigger(trig, now=now)
+
+        if self.nearby_interact_target is None:
+            best_media_d2 = 36.0
+            for ms in self.scene.get("media_screens", []):
+                if not ms.get("interactive", True):
+                    continue
+                mx, my, mz = ms.get("pos", (0.0, 0.0, 0.0))
+                d_sq = (cam_pos[0] - mx) ** 2 + ((cam_pos[1] - 1.8) - my) ** 2 + (cam_pos[2] - mz) ** 2
+                if d_sq <= best_media_d2:
+                    best_media_d2 = d_sq
+                    self.nearby_interact_target = {"_media_screen": ms}
+                    kind_lbl = "YouTube" if ms.get("media_type") == "youtube" else "Web"
+                    self.nearby_interact_prompt = f"[F] Open {ms.get('title') or ms.get('id', 'Screen')} ({kind_lbl})"
 
         if now < self.portal_cooldown_until:
             return
@@ -1329,9 +1684,11 @@ class MakerverseClient:
         self.ghost_active = False
         self.peers.clear()
         self.radio.stop()
+        self.voice.set_ptt(False)
         self._drain_out_queue()
         if self.server_url and self.server_url != norm_url:
             self.prev_server = (self.server_url, self.world or "hub")
+            self.pending_hop_origin = (self.server_url, self.world or "hub", int(time.time()))
         self.reconnect_target = (norm_url, target_world or "hub", spawn_pos, spawn_yaw)
         self.log("HOP", "#00ff66", f"Switching server to {norm_url} (world: {target_world or 'hub'})...")
         self._trigger_ws_reconnect()
@@ -1472,15 +1829,21 @@ class MakerverseClient:
                                 self._record_recent_server(self.server_url, self.node_name)
                                 if data.get("avatar_synced") and self.avatar != "default":
                                     self.log("ID", "#00ff66", f"Carried identity & avatar '{self.avatar}' to {self.node_name}.")
-                                self._apply_world(data.get("world", "hub"), data.get("md", ""), data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0))
+                                if self.pending_hop_origin:
+                                    orig_u, orig_w, _ = self.pending_hop_origin
+                                    self.pending_hop_origin = None
+                                    self.log("NODE", "#00ffcc", f"Arrived at {self.node_name} ({self.server_url}) from {orig_u}/{orig_w}.")
+                                self._apply_world(data.get("world", "hub"), data.get("md", ""), data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0), active_triggers=data.get("active_triggers"))
                             elif mtype == "world_data":
-                                self._apply_world(data.get("world", "hub"), data.get("md", ""), data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0), bool(data.get("in_place")))
+                                self._apply_world(data.get("world", "hub"), data.get("md", ""), data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0), bool(data.get("in_place")), active_triggers=data.get("active_triggers"))
                             elif mtype == "world_cached":
-                                cached = get_cached_world(data.get("world", "hub"))
-                                if cached:
-                                    self._apply_world(cached["world"], cached["md"], data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0))
+                                w_req = _clean_ident(data.get("world", "hub"), 32, "hub")
+                                cached = get_cached_world(w_req)
+                                ok_c, _, _ = validate_mv3d_document(cached["md"], kind="world") if cached else (False, "", [])
+                                if cached and ok_c:
+                                    self._apply_world(cached["world"], cached["md"], data.get("description", ""), data.get("radio_url", ""), data.get("radio_name", ""), data.get("spawn_pos"), data.get("spawn_yaw", 0.0), active_triggers=data.get("active_triggers"))
                                 else:
-                                    await ws.send(json.dumps({"type": "join_world", "world": data.get("world", "hub")}))
+                                    await ws.send(json.dumps({"type": "join_world", "world": w_req}))
                             elif mtype == "world_ratings_top":
                                 ranked = data.get("worlds", [])
                                 if not ranked:
@@ -1628,6 +1991,20 @@ class MakerverseClient:
                                 if data.get("prefabs"):
                                     self.prefabs = data["prefabs"]
                                 self.log("PREFAB", "#00ff66", f"Saved blueprint '{p_nm}' ({int(data.get('count', 1))} block(s)). Stamp with /stamp {p_nm}")
+                            elif mtype == "prefab_deleted":
+                                p_nm = _clean_ident(str(data.get("name", "")), 32, "")
+                                if p_nm:
+                                    cached_p = (PREFAB_CACHE_DIR.resolve() / f"{p_nm}.md").resolve()
+                                    if cached_p.parent == PREFAB_CACHE_DIR.resolve() and cached_p.exists():
+                                        try:
+                                            cached_p.unlink(missing_ok=True)
+                                        except Exception:
+                                            pass
+                                if isinstance(data.get("prefabs"), list):
+                                    self.prefabs = list(data["prefabs"])
+                                elif p_nm in self.prefabs:
+                                    self.prefabs = [x for x in self.prefabs if x != p_nm]
+                                self.log("PREFAB", "#ffaa00", f"Deleted blueprint '{p_nm}'.")
                             elif mtype == "world_backups_list":
                                 snaps = data.get("backups", [])
                                 if not snaps:
@@ -1748,6 +2125,30 @@ class MakerverseClient:
                                     self.peers[sid_mo]["mood"] = m_val
                                     if "mood_pinned" in data:
                                         self.peers[sid_mo]["mood_pinned"] = bool(data["mood_pinned"])
+                            elif mtype == "trigger_sync":
+                                t_id_rem = str(data.get("trigger_id", "") or "")
+                                if t_id_rem:
+                                    self.apply_remote_trigger_sync(t_id_rem, bool(data.get("active", True)))
+                            elif mtype == "world_deleted":
+                                del_w = str(data.get("world", "") or "")
+                                if isinstance(data.get("worlds"), list):
+                                    self.worlds = list(data["worlds"])
+                                elif del_w in self.worlds:
+                                    self.worlds = [w for w in self.worlds if w != del_w]
+                                if data.get("msg"):
+                                    self.log("WORLD", "#ffaa00", str(data["msg"]))
+                            elif mtype == "federation_list":
+                                n_nm = str(data.get("node_name", "Makerverse Node"))
+                                f_peers = data.get("peers", [])
+                                if not f_peers:
+                                    self.log("NODES", "#ffaa00", f"Local node '{n_nm}' has no linked peer servers yet (/linknode <ws://host:port> [label]).")
+                                else:
+                                    self.log("NODES", "#00ff66", f"Federated Peers from '{n_nm}' ({len(f_peers)}):")
+                                    for fp in f_peers:
+                                        st_tag = f"ONLINE ({fp.get('online_count', 0)} online)" if fp.get("online") else "OFFLINE"
+                                        w_preview = ", ".join(fp.get("worlds", [])[:5])
+                                        w_str = f" | worlds: {w_preview}" if w_preview else ""
+                                        self.log("NODE", "#00ffcc", f" - {fp.get('label', '?')} [{fp.get('url', '')}] {st_tag}{w_str}")
                             elif mtype == "media_sync":
                                 sid_m = str(data.get("screen_id", "") or "")
                                 if sid_m:
@@ -1761,6 +2162,27 @@ class MakerverseClient:
                                         "scroll_y": s_y,
                                         "updated_by": str(data.get("nick", "peer")),
                                     }
+                            elif mtype == "voice":
+                                v_sid = str(data.get("short_id", "") or "").strip().lower()
+                                v_nick = str(data.get("nick", "") or "").strip().lower()
+                                if (v_sid and v_sid in self.blocked_users) or (v_nick and v_nick in self.blocked_users):
+                                    continue
+                                matched_peer = self.peers.get(v_sid) or next(
+                                    (p for k, p in self.peers.items() if str(k).lower() == v_sid), None
+                                )
+                                v_gain = 1.0
+                                if isinstance(matched_peer, dict):
+                                    matched_peer["speaking_until"] = time.time() + 0.35
+                                    p_xyz = matched_peer.get("pos", [0.0, 0.0, 0.0])
+                                    dx_v = float(p_xyz[0]) - float(self.cam_pos_ref[0])
+                                    dy_v = float(p_xyz[1]) - float(self.cam_pos_ref[1] - 1.8)
+                                    dz_v = float(p_xyz[2]) - float(self.cam_pos_ref[2])
+                                    dist_v = math.sqrt(dx_v * dx_v + dy_v * dy_v + dz_v * dz_v)
+                                    if dist_v >= 45.0:
+                                        v_gain = 0.0
+                                    elif dist_v > 4.0:
+                                        v_gain = max(0.08, 1.0 - (dist_v - 4.0) / 41.0)
+                                self.voice.play_packet(str(data.get("pcm_b64", "") or ""), _finite_int(data.get("sr", 16000), 16000, 8000, 48000), gain=v_gain)
                             elif mtype == "chat":
                                 sid_c = str(data.get("short_id", "")).strip()
                                 c_nick = str(data.get("nick", "")).strip()
@@ -1859,8 +2281,8 @@ def handle_command(client: MakerverseClient, text: str):
     if cmd == "/help":
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /rotateobj | /paint | /cloneobj | /delobj | /undo | /snap [m]")
-        client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /restore <file.md> | /export")
-        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /peers | /mood <expr> | /tpwp <wp> | /hop <node> | /back | /nick <n>")
+        client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /delprefab <n> | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /restore <file.md> | /export | /chatlog [n]")
+        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /cleanworld | /peers | /voice | /mood <expr> | /nodes | /linknode <url> [lbl] | /hop <node> | /back | /nick <n>")
     elif cmd == "/rate":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /rate <1..5> [comment] or /rate <world> <1..5> [comment]")
@@ -1964,6 +2386,8 @@ def handle_command(client: MakerverseClient, text: str):
     elif cmd == "/mute":
         m = client.radio.toggle_mute()
         client.log("RADIO", "#ffaa00" if m else "#00ff66", "Radio muted." if m else "Radio unmuted.")
+    elif cmd == "/voice":
+        client.voice.toggle()
     elif cmd == "/hop":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", f"Usage: {cmd} <bookmark_name|ws://host:port> [world]")
@@ -2069,6 +2493,7 @@ def handle_command(client: MakerverseClient, text: str):
             cx, cy, cz = client.cam_pos_ref
             wp_pos = [round(cx, 1), round(max(0.0, cy - 1.8), 1), round(cz, 1)]
         client.waypoints[wp_name] = wp_pos
+        save_scoped_waypoints(client.server_url, client.world, client.waypoints)
         client.log("WAYPOINT", "#00ff66", f"Set waypoint '{wp_name}' at ({wp_pos[0]:.1f}, {wp_pos[1]:.1f}, {wp_pos[2]:.1f}).")
     elif cmd == "/delwaypoint":
         if len(parts) < 2 or not parts[1].strip():
@@ -2077,6 +2502,7 @@ def handle_command(client: MakerverseClient, text: str):
         wp_name = _clean_ident(parts[1].strip(), 24, "")
         if wp_name in client.waypoints:
             client.waypoints.pop(wp_name, None)
+            save_scoped_waypoints(client.server_url, client.world, client.waypoints)
             client.log("WAYPOINT", "#00ff66", f"Removed waypoint '{wp_name}'.")
         else:
             client.log("ERR", "#ff4444", f"Waypoint '{parts[1].strip()}' not found.")
@@ -2089,6 +2515,7 @@ def handle_command(client: MakerverseClient, text: str):
         if client.waypoints:
             cnt_w = len(client.waypoints)
             client.waypoints.clear()
+            save_scoped_waypoints(client.server_url, client.world, client.waypoints)
             client.log("WAYPOINTS", "#00ff66", f"Cleared {cnt_w} waypoint(s).")
         else:
             client.log("WAYPOINTS", "#ffaa00", "No waypoints to clear.")
@@ -2171,19 +2598,22 @@ def handle_command(client: MakerverseClient, text: str):
         t_items = [f"{k} ({v['label']})" for k, v in WORLD_TEMPLATES.items()]
         client.log("TEMPLATES", "#00ff66", "Templates: " + ", ".join(t_items))
     elif cmd == "/createworld" and len(parts) > 1:
-        wname = _clean_ident(parts[1], 32, "world")
-        raw_rest = text.strip().split(" ", 2)[2].strip() if len(text.strip().split(" ", 2)) >= 3 else "flat"
-        rest_toks = raw_rest.split(" ", 1)
-        raw_tpl = rest_toks[0].strip() if rest_toks and rest_toks[0].strip() else "flat"
-        tkey, matched_tpl = resolve_world_template_match(raw_tpl)
-        if not matched_tpl:
-            client.log("WARN", "#ffaa00", f"Unknown template '{raw_tpl}'; using 'flat'. Run /templates to see options.")
-        raw_desc = rest_toks[1].strip() if len(rest_toks) >= 2 else ""
-        desc = raw_desc[1:-1] if len(raw_desc) >= 2 and raw_desc[0] == raw_desc[-1] and raw_desc[0] in ('"', "'") else raw_desc
-        clean_send_desc = re.sub(r'[\\"\r\n\x00]', " ", " ".join(desc.split())).strip()[:200]
-        md = build_template_mv3d_world(tkey, wname, clean_send_desc)
-        client.log("BUILD", "#00ffcc", f"Creating world '{wname}' with template '{tkey}' ({WORLD_TEMPLATES[tkey]['label']})...")
-        client.send_json({"type": "upload", "kind": "world", "name": wname, "content": md, "description": clean_send_desc})
+        try:
+            wname = _clean_ident(parts[1], 32, "world")
+            raw_rest = text.strip().split(" ", 2)[2].strip() if len(text.strip().split(" ", 2)) >= 3 else "flat"
+            rest_toks = raw_rest.split(" ", 1)
+            raw_tpl = rest_toks[0].strip() if rest_toks and rest_toks[0].strip() else "flat"
+            tkey, matched_tpl = resolve_world_template_match(raw_tpl)
+            if not matched_tpl:
+                client.log("WARN", "#ffaa00", f"Unknown template '{raw_tpl}'; using 'flat'. Run /templates to see options.")
+            raw_desc = rest_toks[1].strip() if len(rest_toks) >= 2 else ""
+            desc = raw_desc[1:-1] if len(raw_desc) >= 2 and raw_desc[0] == raw_desc[-1] and raw_desc[0] in ('"', "'") else raw_desc
+            clean_send_desc = re.sub(r'[\\"\r\n\x00]', " ", " ".join(desc.split())).strip()[:200]
+            md = build_template_mv3d_world(tkey, wname, clean_send_desc)
+            client.log("BUILD", "#00ffcc", f"Creating world '{wname}' with template '{tkey}' ({WORLD_TEMPLATES[tkey]['label']})...")
+            client.send_json({"type": "upload", "kind": "world", "name": wname, "content": md, "description": clean_send_desc})
+        except Exception as exc:
+            client.log("ERR", "#ff4444", f"World generation failed: {exc}")
     elif cmd == "/prefabs":
         client.send_json({"type": "prefab_action", "action": "list"})
     elif cmd == "/saveprefab":
@@ -2197,6 +2627,18 @@ def handle_command(client: MakerverseClient, text: str):
             client.log("ERR", "#ff4444", "Invalid blueprint name.")
             return
         client.send_json({"type": "prefab_action", "action": "save", "name": p_nm, "count": max(1, min(16, cnt_p)), "world": client.world})
+    elif cmd == "/delprefab":
+        if len(parts) < 2 or not parts[1].strip():
+            client.log("ERR", "#ff4444", "Usage: /delprefab <blueprint_name>")
+            return
+        p_nm = _clean_ident(parts[1].strip(), 32, "")
+        if not p_nm:
+            client.log("ERR", "#ff4444", "Invalid blueprint name.")
+            return
+        if client.role not in ("ADMIN", "BUILDER") and client.connected:
+            client.log("ERR", "#ff4444", "Builder or admin role required to delete blueprints.")
+            return
+        client.send_json({"type": "prefab_action", "action": "delete", "name": p_nm})
     elif cmd == "/stamp":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /stamp <blueprint_name> [scale]")
@@ -2463,6 +2905,23 @@ def handle_command(client: MakerverseClient, text: str):
             client.log("ERR", "#ff4444", "Aim at an object with [I] or pass /delobj <id|node_name>.")
     elif cmd == "/undo":
         client.send_json({"type": "world_edit", "action": "undo", "world": client.world})
+    elif cmd in ("/cleanworld", "/prunedefs"):
+        client.send_json({"type": "world_edit", "action": "clean_defs", "world": client.world})
+    elif cmd in ("/nodes", "/federation"):
+        client.send_json({"type": "federation", "action": "list"})
+    elif cmd == "/linknode":
+        if len(parts) < 2 or not parts[1].strip():
+            client.log("ERR", "#ff4444", "Usage: /linknode <ws://host:port> [label]")
+            return
+        rest_f = text.strip().split(" ", 1)[1].strip().split(" ", 1)
+        u_f = rest_f[0].strip()
+        lbl_f = rest_f[1].strip() if len(rest_f) > 1 else ""
+        client.send_json({"type": "federation", "action": "link", "url": u_f, "label": lbl_f})
+    elif cmd == "/unlinknode":
+        if len(parts) < 2 or not parts[1].strip():
+            client.log("ERR", "#ff4444", "Usage: /unlinknode <ws://host:port|label>")
+            return
+        client.send_json({"type": "federation", "action": "unlink", "url": parts[1].strip()})
     elif cmd == "/backup":
         client.send_json({"type": "world_backup", "action": "create", "world": client.world, "label": parts[1].strip() if len(parts) > 1 else ""})
     elif cmd == "/backups":
@@ -2471,6 +2930,35 @@ def handle_command(client: MakerverseClient, text: str):
         client.send_json({"type": "world_backup", "action": "restore", "world": client.world, "file": parts[1].strip()})
     elif cmd == "/export":
         client.send_json({"type": "world_backup", "action": "export", "world": client.world})
+    elif cmd == "/chatlog":
+        raw_n = parts[1].strip() if len(parts) > 1 and parts[1].strip() else ""
+        if raw_n and re.fullmatch(r"[-+]?\d+", raw_n):
+            n_lines = max(1, min(100, int(raw_n)))
+        else:
+            n_lines = len(client.chat_log)
+        recent_entries = client.chat_log[-n_lines:] if client.chat_log else []
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        ts_lbl = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        safe_w = _clean_ident(client.world, 32, "world")
+        out_fp = (EXPORTS_DIR.resolve() / f"chatlog_{safe_w}_{ts_lbl}.txt").resolve()
+        if out_fp.parent != EXPORTS_DIR.resolve():
+            client.log("ERR", "#ff4444", "Invalid chatlog export path.")
+            return
+        lines_out = [
+            f"# Makerverse Chat Log — world={client.world} server={client.server_url} exported={time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+            "",
+        ]
+        for entry in recent_entries:
+            s_who = entry[0] if len(entry) >= 1 else "?"
+            s_msg = entry[2] if len(entry) >= 3 else ""
+            s_rank = entry[3] if len(entry) >= 4 else ""
+            r_tag = f"[{s_rank}] " if s_rank else ""
+            if s_who == "*":
+                lines_out.append(f"* {r_tag}{s_msg}")
+            else:
+                lines_out.append(f"{r_tag}{s_who}: {s_msg}")
+        _write_secure_file(out_fp, "\n".join(lines_out) + "\n")
+        client.log("CHATLOG", "#00ff66", f"Exported {len(recent_entries)} line(s) -> {out_fp}")
     elif cmd == "/emote" and len(parts) > 1 and parts[1].strip():
         em = _clean_ident(parts[1].strip(), 16, "wave").lower()
         client.local_emote = em
@@ -2623,6 +3111,8 @@ def handle_command(client: MakerverseClient, text: str):
 
 def _get_clipboard_text() -> str:
     try:
+        if pygame is None:
+            raise RuntimeError("no pygame")
         if not pygame.scrap.get_init():
             pygame.scrap.init()
         for mime in ("text/plain;charset=utf-8", "text/plain", pygame.SCRAP_TEXT):
@@ -2655,6 +3145,8 @@ def _set_clipboard_text(text: str) -> bool:
     if not clean_t:
         return False
     try:
+        if pygame is None:
+            raise RuntimeError("no pygame")
         if not pygame.scrap.get_init():
             pygame.scrap.init()
         pygame.scrap.put(pygame.SCRAP_TEXT, clean_t.encode("utf-8"))
@@ -2706,6 +3198,15 @@ def _wrap_hud_line(font, text: str, max_px: int) -> list[str]:
     if current:
         lines.append(current)
     return lines or [""]
+
+
+def _fit_hud_text(font, text: str, max_px: float) -> str:
+    if max_px <= 24 or font.size(text)[0] <= max_px:
+        return text
+    trimmed = text
+    while len(trimmed) > 4 and font.size(trimmed + "...")[0] > max_px:
+        trimmed = trimmed[:-1]
+    return trimmed + "..."
 
 
 def render_peer_modern(renderer: ModernRenderer, peer: dict, vp_mat: np.ndarray, avatar_meshes: dict, now: float = 0.0):
@@ -2844,6 +3345,8 @@ def main():
             norm_start = normalize_ws_url(tok.strip())
             if norm_start:
                 client.server_url = norm_start
+    if pygame is None or shaders is None or websockets is None:
+        raise RuntimeError("3D client requires pygame, PyOpenGL, and websockets installed.")
     client.start_background()
 
     pygame.init()
@@ -2961,6 +3464,8 @@ def main():
                             if len(chat_buffer) < 300:
                                 chat_buffer += event.unicode
                     else:
+                        if event.key in (K_LALT, K_RALT):
+                            client.voice.set_ptt(True)
                         if event.key == K_ESCAPE:
                             if client.ghost_active:
                                 client.ghost_active = False
@@ -2989,15 +3494,48 @@ def main():
                             client.ghost_dist = min(25.0, round(client.ghost_dist + 0.5, 2))
                         elif event.key == K_i:
                             client.inspect_mode = not client.inspect_mode
-                        elif event.key == K_DELETE and client.inspect_mode and not client.ghost_active:
-                            tid_del = _target_placed_id(client)
-                            if tid_del:
-                                client.send_json({"type": "world_edit", "action": "delete_placed", "world": client.world, "tag_id": tid_del})
+                        elif event.key in (K_DELETE, K_BACKSPACE) and not client.ghost_active:
+                            if now - client.last_del_shortcut_at >= 0.25:
+                                tid_del = _target_placed_id(client)
+                                is_placed_target = bool(
+                                    client.looked_at_hit is not None
+                                    and str(client.looked_at_hit[0].get("def_name") or "").startswith("PLACED_")
+                                )
+                                if tid_del and (client.inspect_mode or is_placed_target):
+                                    client.last_del_shortcut_at = now
+                                    if client.role not in ("ADMIN", "BUILDER"):
+                                        client.log("ERR", "#ff4444", "Builder or admin role required to delete objects.")
+                                    else:
+                                        client.send_json({"type": "world_edit", "action": "delete_placed", "world": client.world, "tag_id": tid_del})
+                                        client.looked_at_hit = None
+                                elif event.key == K_DELETE:
+                                    client.last_del_shortcut_at = now
+                                    client.log("INFO", "#ffaa00", "Aim at a placed object (or enable Inspect [I]) to delete it.")
                         elif event.key in (K_MINUS, K_EQUALS) and client.inspect_mode and not client.ghost_active:
                             tid_sc = _target_placed_id(client)
                             if tid_sc:
                                 mult_s = 0.8 if event.key == K_MINUS else 1.25
                                 client.send_json({"type": "world_edit", "action": "mutate_placed", "world": client.world, "op": "scale", "tag_id": tid_sc, "scale_mult": mult_s})
+                        elif event.key in (K_PAGEUP, K_PAGEDOWN) and client.inspect_mode and not client.ghost_active:
+                            if now - client.last_nudge_at >= 0.12:
+                                tid_n = _target_placed_id(client)
+                                if tid_n:
+                                    if client.role not in ("ADMIN", "BUILDER"):
+                                        client.log("ERR", "#ff4444", "Builder or admin role required to move objects.")
+                                    else:
+                                        client.last_nudge_at = now
+                                        step_y = client.grid_snap if client.grid_snap > 0.0 else 0.5
+                                        dy_n = round(step_y if event.key == K_PAGEUP else -step_y, 3)
+                                        client.send_json({
+                                            "type": "world_edit",
+                                            "action": "mutate_placed",
+                                            "world": client.world,
+                                            "op": "move",
+                                            "tag_id": tid_n,
+                                            "dx": 0.0,
+                                            "dy": dy_n,
+                                            "dz": 0.0,
+                                        })
                         elif event.key == K_v:
                             order = ("first", "third", "front")
                             client.camera_mode = order[(order.index(client.camera_mode) + 1) % 3]
@@ -3021,11 +3559,15 @@ def main():
                             client.local_emote_until = now + 2.5
                             client.send_json({"type": "chat", "text": f"/emote {em_n}"})
                         elif event.key in (K_t, K_RETURN, K_SLASH):
+                            client.voice.set_ptt(False)
                             chat_mode = True
                             client.history_idx = None
                             client.history_draft = ""
                             chat_buffer = "/" if event.key == K_SLASH else ""
                             pygame.event.set_grab(False); pygame.mouse.set_visible(True)
+                elif event.type == KEYUP:
+                    if event.key in (K_LALT, K_RALT):
+                        client.voice.set_ptt(False)
                 elif event.type == MOUSEBUTTONDOWN and not chat_mode and mouse_grabbed:
                     if event.button == 1 and client.ghost_active:
                         client.commit_ghost_placement()
@@ -3164,9 +3706,12 @@ def main():
                 glUseProgram(renderer.prog2d)
                 glUniformMatrix4fv(glGetUniformLocation(renderer.prog2d, "uOrtho"), 1, GL_TRUE, ortho_mat)
 
-                renderer.draw_rect_2d(0, 0, WINDOW_W, 38, (0.04, 0.03, 0.10, 0.85))
-                flags = f"{' [GHOST]' if client.ghost_active else ''}{' [FLY]' if client.fly_mode else ''}{' [INSPECT]' if client.inspect_mode else ''}{f' [SNAP:{client.grid_snap}m]' if client.grid_snap > 0.0 else ''}{' [WATCH]' if client.watch_spec else ''}{' [MUTE]' if client.radio.muted else ''}"
-                renderer.draw_text_2d(font, 14, 10, f"MAKERVERSE // mv3d://{client.node_name}/{client.world}.md  |  {client.nick} [{client.role}]{flags}  |  {int(clock.get_fps())} FPS", (0, 255, 204))
+                renderer.draw_rect_2d(0, 0, WINDOW_W, 38, (0.035, 0.025, 0.095, 0.90))
+                renderer.draw_rect_2d(0, 36, WINDOW_W, 2, (0.0, 0.95, 0.80, 0.55))
+                renderer.draw_rect_2d(0, 34, min(180.0, WINDOW_W * 0.25), 2, (1.0, 0.35, 0.78, 0.75))
+                flags = f"{' [GHOST]' if client.ghost_active else ''}{' [FLY]' if client.fly_mode else ''}{' [INSPECT]' if client.inspect_mode else ''}{f' [SNAP:{client.grid_snap}m]' if client.grid_snap > 0.0 else ''}{' [WATCH]' if client.watch_spec else ''}{' [TALKING]' if client.voice.ptt_active else (' [VOICE]' if client.voice.enabled else '')}{' [MUTE]' if client.radio.muted else ''}"
+                top_hdr = _fit_hud_text(font, f"MAKERVERSE // mv3d://{client.node_name}/{client.world}.md  |  {client.nick} [{client.role}]{flags}  |  {int(clock.get_fps())} FPS", WINDOW_W - 28)
+                renderer.draw_text_2d(font, 14, 10, top_hdr, (0, 255, 204))
 
                 # 3D Sign Billboards
                 for obj in client.scene.get("objects", []):
@@ -3214,25 +3759,43 @@ def main():
                     head_y = py + (av_m["height"] + 0.35 if av_m else 2.2)
                     screen_pt = project_3d_to_2d((px, head_y, pz), vp_mat)
                     if screen_pt:
+                        is_speaking = now < float(peer.get("speaking_until", 0.0) or 0.0)
+                        mic_badge = "[MIC] " if is_speaking else ""
                         p_role = normalize_role_name(peer.get("role", ""))
                         p_badge = f"[{p_role}] " if p_role else ""
                         av_tag = f" ({peer['avatar']})" if peer.get("avatar") and peer.get("avatar") != "default" else ""
                         name_body = f"{peer.get('nick', 'Peer')}{av_tag}"
+                        mic_w = font.size(mic_badge)[0] if mic_badge else 0
                         badge_w = font.size(p_badge)[0] if p_badge else 0
-                        total_w = badge_w + font.size(name_body)[0] + 10
+                        total_w = mic_w + badge_w + font.size(name_body)[0] + 10
                         tx_n = screen_pt[0] - total_w * 0.5
                         ty_n = screen_pt[1] - 10
                         renderer.draw_rect_2d(tx_n, ty_n - 2, total_w, 20, (0.03, 0.02, 0.09, 0.78))
+                        cur_tx = tx_n + 5
+                        if mic_badge:
+                            renderer.draw_text_2d(font, cur_tx, ty_n, mic_badge, (0, 255, 130))
+                            cur_tx += mic_w
                         if p_badge:
                             bhx = get_rank_badge_color(p_role).lstrip("#")
                             brgb = (int(bhx[0:2], 16), int(bhx[2:4], 16), int(bhx[4:6], 16))
-                            renderer.draw_text_2d(font, tx_n + 5, ty_n, p_badge, brgb)
-                        renderer.draw_text_2d(font, tx_n + 5 + badge_w, ty_n, name_body, (255, 165, 235))
+                            renderer.draw_text_2d(font, cur_tx, ty_n, p_badge, brgb)
+                            cur_tx += badge_w
+                        renderer.draw_text_2d(font, cur_tx, ty_n, name_body, (255, 165, 235))
 
                 box_w = min(640, max(320, WINDOW_W - 24))
                 box_x, box_y, box_h = 12, WINDOW_H - 212, 200
                 inner_max_w = box_w - 22
-                renderer.draw_rect_2d(box_x, box_y, box_w, box_h, (0.03, 0.02, 0.08, 0.84))
+                renderer.draw_frame_2d(
+                    box_x,
+                    box_y,
+                    box_w,
+                    box_h,
+                    (0.028, 0.020, 0.082, 0.86),
+                    border_rgba=(0.0, 0.90, 0.76, 0.42),
+                    accent_rgba=(1.0, 0.38, 0.80, 0.85),
+                    border_px=1.0,
+                    corner_len=12.0,
+                )
 
                 wrapped_entries = []
                 for entry in client.chat_log[-10:]:
@@ -3267,7 +3830,17 @@ def main():
                     renderer.draw_text_2d(font, cur_x, cur_y, body_s, body_rgb)
 
                 in_x, in_y, in_w, in_h = box_x + 6, box_y + box_h - 32, box_w - 12, 26
-                renderer.draw_rect_2d(in_x, in_y, in_w, in_h, (0.01, 0.01, 0.04, 0.96))
+                renderer.draw_frame_2d(
+                    in_x,
+                    in_y,
+                    in_w,
+                    in_h,
+                    (0.012, 0.012, 0.045, 0.96),
+                    border_rgba=(1.0, 0.38, 0.80, 0.65) if chat_mode else (0.0, 0.85, 0.72, 0.35),
+                    accent_rgba=(0.0, 1.0, 0.82, 0.90) if chat_mode else (1.0, 0.38, 0.80, 0.45),
+                    border_px=1.0,
+                    corner_len=7.0,
+                )
                 if chat_mode:
                     disp_buf = chat_buffer
                     while font.size(f"> {disp_buf}_")[0] > in_w - 12 and len(disp_buf) > 1:
@@ -3286,17 +3859,42 @@ def main():
                 renderer.draw_rect_2d(cx - 1, cy - 10, 2, 7, ret_col)
                 renderer.draw_rect_2d(cx - 1, cy + 3, 2, 7, ret_col)
 
+                side_pw = min(420, max(260, WINDOW_W - 24))
+                side_px = WINDOW_W - side_pw - 12
+
                 if client.ghost_active:
                     gx_h, gy_h, gz_h, gyaw_h = client._compute_ghost_placement()
                     g_iy = 120 if client.inspect_mode else 50
-                    g_ix, g_iw, g_ih = WINDOW_W - 432, 420, 62
-                    renderer.draw_rect_2d(g_ix, g_iy, g_iw, g_ih, (0.02, 0.07, 0.11, 0.90))
-                    renderer.draw_text_2d(font, g_ix + 10, g_iy + 8, f"GHOST [B]: {client.ghost_shape.upper()} | {client.ghost_color} | {client.ghost_scale:.2f}x | {client.ghost_dist:.1f}m", (0, 255, 215))
-                    renderer.draw_text_2d(font, g_ix + 10, g_iy + 32, f"XYZ ({gx_h:.1f}, {gy_h:.1f}, {gz_h:.1f}) yaw {gyaw_h:.0f} deg - [LMB] Place | [Esc] Cancel", (175, 245, 220))
+                    g_ix, g_iw, g_ih = side_px, side_pw, 62
+                    renderer.draw_frame_2d(
+                        g_ix,
+                        g_iy,
+                        g_iw,
+                        g_ih,
+                        (0.018, 0.062, 0.105, 0.90),
+                        border_rgba=(0.0, 1.0, 0.82, 0.55),
+                        accent_rgba=(1.0, 0.40, 0.82, 0.85),
+                        border_px=1.0,
+                        corner_len=10.0,
+                    )
+                    g_l1 = _fit_hud_text(font, f"GHOST [B]: {client.ghost_shape.upper()} | {client.ghost_color} | {client.ghost_scale:.2f}x | {client.ghost_dist:.1f}m", g_iw - 20)
+                    g_l2 = _fit_hud_text(font, f"XYZ ({gx_h:.1f}, {gy_h:.1f}, {gz_h:.1f}) yaw {gyaw_h:.0f} deg - [LMB] Place | [Esc] Cancel", g_iw - 20)
+                    renderer.draw_text_2d(font, g_ix + 10, g_iy + 8, g_l1, (0, 255, 215))
+                    renderer.draw_text_2d(font, g_ix + 10, g_iy + 32, g_l2, (175, 245, 220))
 
                 if client.inspect_mode:
-                    ix, iy, iw, ih = WINDOW_W - 432, 50, 420, 62
-                    renderer.draw_rect_2d(ix, iy, iw, ih, (0.03, 0.02, 0.10, 0.88))
+                    ix, iy, iw, ih = side_px, 50, side_pw, 62
+                    renderer.draw_frame_2d(
+                        ix,
+                        iy,
+                        iw,
+                        ih,
+                        (0.028, 0.020, 0.095, 0.90),
+                        border_rgba=(1.0, 0.40, 0.80, 0.55),
+                        accent_rgba=(0.0, 1.0, 0.82, 0.85),
+                        border_px=1.0,
+                        corner_len=10.0,
+                    )
                     if client.looked_at_hit is not None:
                         hit_obj, hit_dist, _, _ = client.looked_at_hit
                         hx_p, hy_p, hz_p = hit_obj["pos"]
@@ -3308,16 +3906,31 @@ def main():
                         else:
                             n_name = str(hit_obj.get("node_name") or "").strip()
                             tag_lbl = f" [{n_name.split(':', 1)[-1].strip()}]" if n_name else ""
-                        renderer.draw_text_2d(font, ix + 10, iy + 8, f"TARGET {hit_obj['kind'].upper()}{tag_lbl} ({hit_dist:.1f}m)", (0, 255, 160))
-                        renderer.draw_text_2d(font, ix + 10, iy + 32, f"XYZ ({hx_p:.1f}, {hy_p:.1f}, {hz_p:.1f}) - [Del] Remove | [R] Rot45 | /paint", (255, 150, 220))
+                        extra_meta = ""
+                        if hit_obj.get("is_portal"):
+                            m_port = next((p for p in client.scene.get("portals", []) if p.get("pos") == hit_obj.get("pos")), None)
+                            if m_port:
+                                s_pref = f"{m_port['server']}/" if m_port.get("server") else ""
+                                extra_meta = f" -> {s_pref}{m_port.get('to', 'hub')}"
+                        elif isinstance(hit_obj.get("media"), dict):
+                            m_spec = hit_obj["media"]
+                            extra_meta = f" [{m_spec.get('media_type', 'web').upper()}: {m_spec.get('title', 'Screen')}]"
+                        elif hit_obj.get("expressions"):
+                            extra_meta = f" [expr:{','.join(hit_obj['expressions'])}]"
+                        i_l1 = _fit_hud_text(font, f"TARGET {hit_obj['kind'].upper()}{tag_lbl}{extra_meta} ({hit_dist:.1f}m)", iw - 20)
+                        i_l2 = _fit_hud_text(font, f"XYZ ({hx_p:.1f}, {hy_p:.1f}, {hz_p:.1f}) - [PgUp/Dn] Y | [Del] Rem | [R] Rot", iw - 20)
+                        renderer.draw_text_2d(font, ix + 10, iy + 8, i_l1, (0, 255, 160))
+                        renderer.draw_text_2d(font, ix + 10, iy + 32, i_l2, (255, 150, 220))
                     else:
-                        renderer.draw_text_2d(font, ix + 10, iy + 20, "INSPECT [I]: Aim reticle at an object", (160, 200, 190))
+                        i_idle = _fit_hud_text(font, "INSPECT [I]: Aim reticle at an object", iw - 20)
+                        renderer.draw_text_2d(font, ix + 10, iy + 20, i_idle, (160, 200, 190))
                 glEnable(GL_DEPTH_TEST)
 
             pygame.display.flip()
     finally:
         client.running = False
         client.radio.stop()
+        client.voice.stop()
         renderer.clear_dynamic_vaos()
         pygame.quit()
 

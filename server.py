@@ -1,4 +1,5 @@
 import asyncio
+import html
 import ipaddress
 import json
 import math
@@ -29,6 +30,7 @@ from mv3d import (
     mutate_placed_md_snippet,
     parse_color,
     parse_mv3d,
+    prune_unused_defs_md,
     remove_placed_md_snippet,
     update_mv3d_frontmatter,
     validate_mv3d_document,
@@ -36,6 +38,8 @@ from mv3d import (
 
 HOST = "0.0.0.0"
 PORT = 8765
+STATUS_PORT = 8766
+MAX_PERSISTENT_TRIGGERS = 128
 def _resolve_server_data_dir(argv: list[str] | None = None) -> Path:
     args = sys.argv[1:] if argv is None else argv
     env_dir = os.environ.get("MAKERVERSE_SERVER_DATA_DIR", "").strip()
@@ -122,6 +126,7 @@ def migrate_server_layout():
 DEFAULT_SERVER_CONFIG = {
     "host": HOST,
     "port": PORT,
+    "status_port": STATUS_PORT,
     "node_name": "Makerverse Node",
     "node_desc": "Self-Hosted #MV3D Markdown Metaverse Node",
     "default_role": "builder",
@@ -146,6 +151,10 @@ def load_server_config() -> dict:
             cfg["host"] = host_v
         if _is_strict_int(raw.get("port")) and 1 <= int(raw["port"]) <= 65535:
             cfg["port"] = int(raw["port"])
+        if _is_strict_int(raw.get("status_port")) and 0 <= int(raw["status_port"]) <= 65535:
+            cfg["status_port"] = int(raw["status_port"])
+        else:
+            cfg["status_port"] = (cfg["port"] + 1) if cfg["port"] < 65535 else 0
         n_name = re.sub(r"[\x00-\x1f\x7f]", " ", str(raw.get("node_name", cfg["node_name"]))).strip()[:48]
         if n_name:
             cfg["node_name"] = n_name
@@ -197,11 +206,12 @@ def get_runtime_server_config() -> dict:
 
 
 def apply_runtime_server_config(cfg: dict | None = None) -> dict:
-    global HOST, PORT, MAX_FILE_SIZE, MAX_AVATAR_SIZE, MAX_AUTO_BACKUPS
+    global HOST, PORT, STATUS_PORT, MAX_FILE_SIZE, MAX_AVATAR_SIZE, MAX_AUTO_BACKUPS
     global AUTH_TIMEOUT_SEC, MAX_CONNECTIONS_PER_IP, MAX_PREFABS_TOTAL
     eff = cfg if cfg is not None else get_runtime_server_config()
     HOST = eff["host"]
     PORT = eff["port"]
+    STATUS_PORT = int(eff.get("status_port", (PORT + 1) if PORT < 65535 else 0))
     MAX_FILE_SIZE = int(eff["max_world_size_kb"]) * 1024
     MAX_AVATAR_SIZE = int(eff["max_avatar_size_kb"]) * 1024
     MAX_AUTO_BACKUPS = int(eff["max_auto_backups"])
@@ -225,8 +235,10 @@ MAX_PREFABS_TOTAL = 256
 
 RATE_LIMITS = {
     "move": (30, 1.0),
+    "voice": (40, 1.0),
     "media_sync": (20, 5.0),
     "mood_sync": (20, 5.0),
+    "trigger_sync": (20, 5.0),
     "chat": (6, 4.0),
     "upload": (4, 30.0),
     "world_backup": (6, 15.0),
@@ -310,6 +322,244 @@ def _safe_child_path(base_dir: Path, filename: str) -> Path | None:
     if cand.parent != base_res:
         return None
     return cand
+
+
+
+def get_persistent_triggers(w_entry: dict | None, parsed_scene: dict | None = None) -> dict[str, bool]:
+    if not isinstance(w_entry, dict):
+        return {}
+    raw_pt = w_entry.get("persistent_triggers")
+    if not isinstance(raw_pt, dict):
+        return {}
+    valid_ids: set[str] | None = None
+    if isinstance(parsed_scene, dict) and isinstance(parsed_scene.get("triggers"), list):
+        valid_ids = {
+            sanitize_name(str(t.get("id", ""))).lower()
+            for t in parsed_scene["triggers"]
+            if isinstance(t, dict) and str(t.get("id", "")).strip()
+        }
+    out: dict[str, bool] = {}
+    for k, v in list(raw_pt.items())[:MAX_PERSISTENT_TRIGGERS]:
+        ck = sanitize_name(str(k or "")).lower()
+        if not ck or not isinstance(v, bool):
+            continue
+        if valid_ids is not None and ck not in valid_ids:
+            continue
+        out[ck] = bool(v)
+    return out
+
+
+def reconcile_persistent_triggers(world_name: str, md_text: str, meta: dict | None = None) -> dict[str, bool]:
+    w_key = sanitize_name(world_name)
+    all_meta = meta if isinstance(meta, dict) else load_world_meta()
+    w_entry = all_meta.get(w_key)
+    if not isinstance(w_entry, dict):
+        return {}
+    scene = parse_mv3d(md_text)
+    cleaned = get_persistent_triggers(w_entry, scene)
+    if w_entry.get("persistent_triggers") != cleaned:
+        if cleaned:
+            w_entry["persistent_triggers"] = cleaned
+        else:
+            w_entry.pop("persistent_triggers", None)
+        all_meta[w_key] = w_entry
+        if meta is None:
+            save_world_meta(all_meta)
+    return cleaned
+
+
+def set_persistent_trigger_state(world_name: str, trig_id: str, active: bool, md_text: str = "") -> tuple[bool, dict[str, bool]]:
+    w_key = sanitize_name(world_name)
+    t_key = sanitize_name(str(trig_id or "")).lower()
+    if not w_key or not t_key:
+        return False, {}
+    meta = load_world_meta()
+    w_entry = dict(meta.get(w_key) or {})
+    if md_text:
+        scene = parse_mv3d(md_text)
+        known_ids = {
+            sanitize_name(str(t.get("id", ""))).lower()
+            for t in scene.get("triggers", [])
+            if isinstance(t, dict) and str(t.get("id", "")).strip()
+        }
+        if known_ids and t_key not in known_ids:
+            return False, get_persistent_triggers(w_entry, scene)
+    cur_map = get_persistent_triggers(w_entry)
+    new_val = bool(active)
+    if cur_map.get(t_key, False) == new_val:
+        return False, cur_map
+    if new_val:
+        if t_key not in cur_map and len(cur_map) >= MAX_PERSISTENT_TRIGGERS:
+            return False, cur_map
+        cur_map[t_key] = True
+    else:
+        cur_map.pop(t_key, None)
+    if cur_map:
+        w_entry["persistent_triggers"] = cur_map
+    else:
+        w_entry.pop("persistent_triggers", None)
+    meta[w_key] = w_entry
+    save_world_meta(meta)
+    return True, cur_map
+
+
+def build_public_directory_payload() -> dict:
+    cfg = load_server_config()
+    fed = load_federation()
+    meta = load_world_meta()
+    online_by_world: dict[str, int] = {}
+    for st in CLIENTS.values():
+        w = str(st.get("world") or "hub")
+        online_by_world[w] = online_by_world.get(w, 0) + 1
+    public_worlds = []
+    for fp in sorted(WORLDS_DIR.glob("*.md")):
+        wname = fp.stem
+        raw_ent = meta.get(wname, {})
+        if bool(raw_ent.get("private", False)):
+            continue
+        md_txt = read_md_safe(fp)
+        eff_m, scene_m, _ = _effective_world_meta(wname, raw_ent, md_txt)
+        avg_r, cnt_r, _ = summarize_world_ratings(raw_ent)
+        public_worlds.append({
+            "world": wname,
+            "title": eff_m["title"],
+            "description": eff_m["description"],
+            "tags": eff_m["tags"],
+            "players_online": online_by_world.get(wname, 0),
+            "objects": len(scene_m.get("objects", [])),
+            "portals": len(scene_m.get("portals", [])),
+            "triggers": len(scene_m.get("triggers", [])),
+            "avg_rating": avg_r,
+            "rating_count": cnt_r,
+        })
+    peers_out = [
+        {"url": u, "label": str(m.get("label") or u)[:48], "default_world": str(m.get("default_world") or "hub")[:32]}
+        for u, m in fed.get("peers", {}).items()
+    ]
+    return {
+        "status": "online",
+        "protocol": "makerverse-mv3d-v2",
+        "node_name": fed.get("node_name", cfg["node_name"]),
+        "node_desc": fed.get("node_desc", cfg["node_desc"]),
+        "ws_port": int(cfg["port"]),
+        "online_count": len(CLIENTS),
+        "max_players": int(cfg.get("max_players", 0) or 0),
+        "public_worlds": public_worlds,
+        "federation_peers": peers_out,
+        "generated_at": int(time.time()),
+    }
+
+
+def render_status_html(payload: dict) -> str:
+    n_name = html.escape(str(payload.get("node_name", "Makerverse Node")))
+    n_desc = html.escape(str(payload.get("node_desc", "")))
+    ws_p = int(payload.get("ws_port", PORT))
+    on_c = int(payload.get("online_count", 0))
+    max_p = int(payload.get("max_players", 0) or 0)
+    cap_txt = f"{on_c} / {max_p}" if max_p > 0 else f"{on_c}"
+    world_rows = []
+    for w in payload.get("public_worlds", []):
+        w_id = html.escape(str(w.get("world", "")))
+        w_title = html.escape(str(w.get("title", w_id)))
+        w_desc = html.escape(str(w.get("description", "")))
+        w_tags = " ".join(f"<span class='tag'>#{html.escape(str(t))}</span>" for t in w.get("tags", []))
+        w_on = int(w.get("players_online", 0))
+        w_rat = f"{float(w.get('avg_rating', 0.0)):.1f}/5 ({int(w.get('rating_count', 0))})" if int(w.get("rating_count", 0)) > 0 else "-"
+        world_rows.append(
+            f"<tr><td><b>{w_id}</b><br><span class='sub'>{w_title}</span></td>"
+            f"<td>{w_desc} {w_tags}</td>"
+            f"<td class='num'>{w_on}</td>"
+            f"<td class='num'>{int(w.get('objects', 0))}</td>"
+            f"<td class='num'>{w_rat}</td></tr>"
+        )
+    worlds_html = "\n".join(world_rows) or "<tr><td colspan='5'>No public worlds published yet.</td></tr>"
+    peer_items = [
+        f"<li><b>{html.escape(str(p.get('label', '')))}</b> <code>{html.escape(str(p.get('url', '')))}</code></li>"
+        for p in payload.get("federation_peers", [])
+    ]
+    peers_html = "\n".join(peer_items) or "<li>No federated peer nodes configured.</li>"
+    return (
+        f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{n_name} // Makerverse Node Status</title>"
+        f"<style>body{{background:#070b14;color:#d8f8ff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0;padding:24px}}"
+        f".wrap{{max-width:960px;margin:0 auto;background:#0d1526;border:1px solid #1ee3c5;padding:20px 24px}}"
+        f"h1{{margin:0 0 6px;color:#1ee3c5;font-size:1.4rem}}.desc{{color:#8fb3cc;margin:0 0 16px}}"
+        f".meta{{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:20px;font-size:0.9rem}}"
+        f".pill{{background:#132038;border:1px solid #29486b;padding:6px 12px;color:#ff77d4}}"
+        f"h2{{color:#ff77d4;font-size:1.05rem;border-bottom:1px solid #223554;padding-bottom:6px;margin-top:22px}}"
+        f"table{{width:100%;border-collapse:collapse;font-size:0.88rem}}th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid #1b2a42}}"
+        f"th{{color:#1ee3c5}}td.num,th.num{{text-align:right}}.sub{{color:#7fa3bd;font-size:0.8rem}}"
+        f".tag{{display:inline-block;background:#14283d;color:#5cf2dc;padding:1px 6px;margin-left:4px;font-size:0.78rem}}"
+        f"code{{color:#ffd166}}ul{{padding-left:18px}}</style></head><body><div class='wrap'>"
+        f"<h1>{n_name}</h1><p class='desc'>{n_desc}</p><div class='meta'>"
+        f"<div class='pill'>STATUS: ONLINE</div><div class='pill'>WS PORT: {ws_p}</div>"
+        f"<div class='pill'>PLAYERS ONLINE: {cap_txt}</div>"
+        f"<div class='pill'><a href='/status.json' style='color:#5cf2dc'>/status.json</a></div></div>"
+        f"<h2>Public Worlds</h2><table><thead><tr><th>World</th><th>Summary &amp; Tags</th><th class='num'>Online</th><th class='num'>Objects</th><th class='num'>Rating</th></tr></thead>"
+        f"<tbody>{worlds_html}</tbody></table><h2>Federated Peers</h2><ul>{peers_html}</ul></div></body></html>"
+    )
+
+
+async def _handle_http_status_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        req_line = await asyncio.wait_for(reader.readline(), timeout=3.0)
+        if not req_line or len(req_line) > 2048:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        parts = req_line.decode("latin-1", errors="replace").strip().split()
+        if len(parts) < 2:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        method, raw_target = parts[0].upper(), parts[1]
+        for _ in range(64):
+            hline = await asyncio.wait_for(reader.readline(), timeout=3.0)
+            if not hline or hline in (b"\r\n", b"\n"):
+                break
+        if method not in ("GET", "HEAD"):
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        path_only = urllib.parse.urlsplit(raw_target).path or "/"
+        payload = build_public_directory_payload()
+        if path_only in ("/status.json", "/directory.json", "/health"):
+            body_bytes = json.dumps(payload, indent=2).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        elif path_only in ("/", "/index.html", "/status"):
+            body_bytes = render_status_html(payload).encode("utf-8")
+            ctype = "text/html; charset=utf-8"
+        else:
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nNot Found\n")
+            await writer.drain()
+            return
+        headers = (
+            f"HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {len(body_bytes)}\r\n"
+            f"Cache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
+        ).encode("ascii")
+        writer.write(headers)
+        if method == "GET":
+            writer.write(body_bytes)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def start_status_http_server(host: str, status_port: int):
+    if not status_port or status_port <= 0:
+        return None
+    try:
+        return await asyncio.start_server(_handle_http_status_client, host, status_port)
+    except Exception as exc:
+        print(f"[WARN] Could not start HTTP status page on {host}:{status_port}: {exc}")
+        return None
 
 
 async def is_safe_public_stream_url_async(url: str) -> tuple[bool, str]:
@@ -503,7 +753,7 @@ def load_server_plugins() -> dict:
             "DESC: Spawn a glowing cyan pillar in front of you\n"
             "ROLE: builder\n"
             "ACTION: spawn_md\n"
-            'VALUE: # Node: PluginPillar\n* **pos**: [{x}, 2.0, {z_front}]\n* **cylinder**: {{ radius: 0.5, height: 4.0, color: "#00ffd9", glow: "#00b399" }}\n'
+            'VALUE: # Node: PluginPillar\n* **pos**: [{x}, 2.0, {z_front}]\n* **cylinder**: { radius: 0.5, height: 4.0, color: "#00ffd9", glow: "#00b399" }\n'
             "---\n"
             "COMMAND: /announce\n"
             "DESC: Broadcast a server-wide banner message\n"
@@ -590,6 +840,10 @@ CLIENTS = {}
 IP_CONNECTIONS: dict[str, int] = {}
 USED_NONCES: dict[str, float] = {}
 UPLOAD_LOCK = asyncio.Lock()
+META_LOCK = asyncio.Lock()
+PERM_LOCK = asyncio.Lock()
+FRIEND_LOCK = asyncio.Lock()
+FED_LOCK = asyncio.Lock()
 
 
 def _prune_used_nonces(now: float):
@@ -730,6 +984,9 @@ def _build_world_data_packet(world: str, md_body: str, w_entry: dict, in_place: 
         "md": md_body,
         "in_place": in_place,
     }
+    pt = get_persistent_triggers(w_entry)
+    if pt:
+        pkt["active_triggers"] = pt
     if w_entry.get("spawn_pos"):
         pkt["spawn_pos"] = w_entry["spawn_pos"]
         pkt["spawn_yaw"] = float(w_entry.get("spawn_yaw", 0.0) or 0.0)
@@ -876,6 +1133,7 @@ def build_world_info_payload(target: str, meta: dict, perms: dict) -> dict:
         "object_count": len(parsed_scene.get("objects", [])),
         "portal_count": len(parsed_scene.get("portals", [])),
         "trigger_count": len(parsed_scene.get("triggers", [])),
+        "active_triggers": get_persistent_triggers(w_entry, parsed_scene),
         "players": [
             {"nick": st["nick"], "short_id": st["short_id"], "role": st["role"]}
             for st in CLIENTS.values()
@@ -913,6 +1171,7 @@ async def send_world_transition(
         return
     md_text = read_md_safe(md_path)
     w_meta, _, _ = _effective_world_meta(target, w_meta, md_text)
+    pt_map = get_persistent_triggers(w_meta)
     sp_pos, sp_yaw = get_world_spawn(target, w_meta)
     if spawn_override is not None:
         sp_pos = list(spawn_override)
@@ -931,6 +1190,8 @@ async def send_world_transition(
         "radio_url": w_meta.get("radio_url", ""),
         "radio_name": w_meta.get("radio_name", ""),
     }
+    if pt_map:
+        msg["active_triggers"] = pt_map
     if msg["type"] == "world_data":
         msg["md"] = md_text
     if w_meta.get("spawn_pos") or spawn_override is not None:
@@ -1026,16 +1287,15 @@ async def handler(websocket):
             msg_type = str(data.get("type", ""))
 
             if msg_type == "node_info" and client_state is None:
+                dir_pay = build_public_directory_payload()
                 fed = load_federation()
-                meta = load_world_meta()
-                worlds_list = sorted(f.stem for f in WORLDS_DIR.glob("*.md") if not meta.get(f.stem, {}).get("private", False))
                 await websocket.send(json.dumps({
                     "type": "node_info_ok",
-                    "node_name": fed.get("node_name", "Makerverse Node"),
-                    "node_desc": fed.get("node_desc", ""),
-                    "online_count": len(CLIENTS),
-                    "max_players": int(get_runtime_server_config().get("max_players", 0) or 0),
-                    "worlds": worlds_list,
+                    "node_name": dir_pay["node_name"],
+                    "node_desc": dir_pay["node_desc"],
+                    "online_count": dir_pay["online_count"],
+                    "max_players": dir_pay["max_players"],
+                    "worlds": [w["world"] for w in dir_pay["public_worlds"]],
                     "peers": [
                         {"url": u, "label": m.get("label", u), "default_world": m.get("default_world", "hub")}
                         for u, m in fed.get("peers", {}).items()
@@ -1134,6 +1394,7 @@ async def handler(websocket):
 
                 md_text = read_md_safe(WORLDS_DIR / f"{world}.md")
                 w_meta, _, _ = _effective_world_meta(world, meta.get(world, {}), md_text)
+                pt_map = get_persistent_triggers(w_meta)
                 sp_pos, sp_yaw = get_world_spawn(world, w_meta)
                 ov_sp, ov_yaw = _sanitize_spawn_override(data.get("spawn_pos"), data.get("spawn_yaw"))
                 if ov_sp is not None:
@@ -1180,6 +1441,8 @@ async def handler(websocket):
                     "worlds": worlds_list,
                     "avatars": avatars_list,
                 }
+                if pt_map:
+                    auth_payload["active_triggers"] = pt_map
                 if w_meta.get("spawn_pos") or ov_sp is not None:
                     auth_payload["spawn_pos"] = sp_pos
                     auth_payload["spawn_yaw"] = sp_yaw
@@ -1264,6 +1527,37 @@ async def handler(websocket):
                     "mood": mood_val,
                     "mood_pinned": pinned_val,
                 }, exclude_ws=websocket)
+
+            elif msg_type == "trigger_sync":
+                trig_id = sanitize_name(str(data.get("trigger_id", "")))
+                if trig_id:
+                    is_act = bool(data.get("active", True))
+                    w_cur = client_state["world"]
+                    md_cur_fp = _safe_child_path(WORLDS_DIR, f"{w_cur}.md")
+                    md_cur_txt = read_md_safe(md_cur_fp) if (md_cur_fp and md_cur_fp.exists()) else ""
+                    async with META_LOCK:
+                        set_persistent_trigger_state(w_cur, trig_id, is_act, md_text=md_cur_txt)
+                    await broadcast_world(w_cur, {
+                        "type": "trigger_sync",
+                        "short_id": client_state["short_id"],
+                        "nick": client_state["nick"],
+                        "trigger_id": trig_id,
+                        "active": is_act,
+                    }, exclude_ws=websocket)
+
+            elif msg_type == "voice":
+                if client_state.get("role") == "banned":
+                    continue
+                pcm_b64 = str(data.get("pcm_b64", "") or "").strip()
+                sr = _finite_int(data.get("sr", 16000), 16000, 8000, 48000)
+                if pcm_b64 and len(pcm_b64) <= 131072 and (len(pcm_b64) % 4) == 0 and re.fullmatch(r"[A-Za-z0-9+/=]+", pcm_b64):
+                    await broadcast_world(client_state["world"], {
+                        "type": "voice",
+                        "short_id": client_state["short_id"],
+                        "nick": client_state["nick"],
+                        "pcm_b64": pcm_b64,
+                        "sr": sr,
+                    }, exclude_ws=websocket)
 
             elif msg_type == "chat":
                 text = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("text", "")))[:300].strip()
@@ -1407,7 +1701,7 @@ async def handler(websocket):
                 if not target or target.lower() == "hub" or md_path is None or not md_path.exists():
                     await websocket.send(json.dumps({"type": "error", "msg": f"Cannot delete '{target}'."}))
                     continue
-                async with UPLOAD_LOCK:
+                async with UPLOAD_LOCK, META_LOCK:
                     create_world_snapshot(target, label="pre_delete")
                     md_path.unlink()
                     meta = load_world_meta()
@@ -1416,8 +1710,13 @@ async def handler(websocket):
                     hub_meta = meta.get("hub", {})
                     for peer_ws, peer_st in list(CLIENTS.items()):
                         if peer_st["world"] == target:
+                            try:
+                                await peer_ws.send(json.dumps({"type": "world_deleted", "world": target, "msg": f"World '{target}' was deleted. Returning to hub."}))
+                            except Exception:
+                                pass
                             await send_world_transition(peer_ws, peer_st, "hub", hub_meta)
-                await websocket.send(json.dumps({"type": "info", "msg": f"Deleted world '{target}'."}))
+                worlds_after = [f.stem for f in WORLDS_DIR.glob("*.md") if can_visit_world(f.stem, meta.get(f.stem, {}), client_state["pubkey"], client_state["role"])]
+                await websocket.send(json.dumps({"type": "world_deleted", "world": target, "worlds": worlds_after, "msg": f"Deleted world '{target}'."}))
 
             elif msg_type == "world_edit":
                 action = str(data.get("action", ""))
@@ -1427,7 +1726,7 @@ async def handler(websocket):
                     await websocket.send(json.dumps({"type": "error", "msg": f"World '{target}' does not exist."}))
                     continue
 
-                async with UPLOAD_LOCK:
+                async with UPLOAD_LOCK, META_LOCK:
                     meta = load_world_meta()
                     w_entry = meta.get(target, {})
                     if not can_edit_world(target, w_entry, client_state["pubkey"], client_state["role"]):
@@ -1435,7 +1734,9 @@ async def handler(websocket):
                         continue
 
                     def _world_update_msg(md_body: str) -> dict:
-                        return _build_world_data_packet(target, md_body, w_entry, in_place=True)
+                        reconcile_persistent_triggers(target, md_body, meta)
+                        save_world_meta(meta)
+                        return _build_world_data_packet(target, md_body, meta.get(target, {}), in_place=True)
 
                     if action in ("set_spawn", "clear_spawn"):
                         cur_md = read_md_safe(md_path)
@@ -1629,6 +1930,17 @@ async def handler(websocket):
                         await broadcast_world(target, _world_update_msg(updated_md))
                         await websocket.send(json.dumps({"type": "info", "msg": f"Removed [{tag_id}]."}))
 
+                    elif action == "clean_defs":
+                        cur_md = read_md_safe(md_path)
+                        cleaned_md, pruned_cnt = prune_unused_defs_md(cur_md)
+                        if pruned_cnt <= 0:
+                            await websocket.send(json.dumps({"type": "info", "msg": f"No unused @def blueprints in '{target}'."}))
+                            continue
+                        create_world_snapshot(target, label="auto")
+                        _atomic_write_text(md_path, cleaned_md)
+                        await broadcast_world(target, _world_update_msg(cleaned_md))
+                        await websocket.send(json.dumps({"type": "info", "msg": f"Pruned {pruned_cnt} unused @def blueprint(s) from '{target}'."}))
+
                     elif action == "undo":
                         w_backup_dir = BACKUPS_DIR / target
                         auto_snaps = sorted(w_backup_dir.glob("*_auto*.md"), reverse=True) if w_backup_dir.exists() else []
@@ -1671,7 +1983,7 @@ async def handler(websocket):
                     continue
 
                 if kind == "world":
-                    async with UPLOAD_LOCK:
+                    async with UPLOAD_LOCK, META_LOCK:
                         meta = load_world_meta()
                         w_entry = meta.get(name, {})
                         w_path = _safe_child_path(WORLDS_DIR, f"{name}.md")
@@ -1717,11 +2029,12 @@ async def handler(websocket):
                             w_entry.pop("spawn_pos", None)
                             w_entry.pop("spawn_yaw", None)
                         meta[name] = w_entry
+                        reconcile_persistent_triggers(name, content, meta)
                         save_world_meta(meta)
                         _atomic_write_text(w_path, content)
                         worlds_list = [f.stem for f in WORLDS_DIR.glob("*.md") if can_visit_world(f.stem, meta.get(f.stem, {}), client_state["pubkey"], client_state["role"])]
                     if not is_new:
-                        await broadcast_world(name, _build_world_data_packet(name, content, w_entry, in_place=True), exclude_ws=websocket)
+                        await broadcast_world(name, _build_world_data_packet(name, content, meta.get(name, {}), in_place=True), exclude_ws=websocket)
                     await websocket.send(json.dumps({"type": "upload_ok", "kind": "world", "name": name, "worlds": worlds_list}))
 
                 elif kind == "avatar":
@@ -2025,7 +2338,7 @@ async def handler(websocket):
                     if snap_path is None or not snap_path.exists():
                         await websocket.send(json.dumps({"type": "error", "msg": "Backup not found."}))
                         continue
-                    async with UPLOAD_LOCK:
+                    async with UPLOAD_LOCK, META_LOCK:
                         create_world_snapshot(target, label="pre_restore")
                         restored_md = read_md_safe(snap_path)
                         _atomic_write_text(md_path, restored_md)
@@ -2038,8 +2351,10 @@ async def handler(websocket):
                             w_entry.pop("spawn_yaw", None)
                         w_entry["updated_at"] = int(time.time())
                         meta[target] = w_entry
+                        reconcile_persistent_triggers(target, restored_md, meta)
                         save_world_meta(meta)
-                    await broadcast_world(target, _build_world_data_packet(target, restored_md, w_entry, in_place=True))
+                        pkt_rest = _build_world_data_packet(target, restored_md, meta.get(target, {}), in_place=True)
+                    await broadcast_world(target, pkt_rest)
                     await websocket.send(json.dumps({"type": "info", "msg": f"Restored '{target}' from {raw_file}."}))
                 elif action == "export":
                     await websocket.send(json.dumps({"type": "world_export_data", "world": target, "md": read_md_safe(md_path), "meta": w_entry, "save_path": str(data.get("save_path", ""))}))
@@ -2052,7 +2367,16 @@ async def handler(websocket):
                     urls = list(peers_map.keys())
                     statuses = await asyncio.gather(*(probe_federated_node(u) for u in urls)) if urls else []
                     out_peers = [
-                        {"url": u, "label": peers_map[u].get("label", u), "online": st.get("online", False), "online_count": st.get("online_count", 0), "worlds": st.get("worlds", [])}
+                        {
+                            "url": u,
+                            "label": peers_map[u].get("label", u),
+                            "default_world": peers_map[u].get("default_world", "hub"),
+                            "online": st.get("online", False),
+                            "node_name": st.get("node_name", ""),
+                            "node_desc": st.get("node_desc", ""),
+                            "online_count": st.get("online_count", 0),
+                            "worlds": st.get("worlds", []),
+                        }
                         for u, st in zip(urls, statuses)
                     ]
                     await websocket.send(json.dumps({"type": "federation_list", "node_name": fed.get("node_name", "Makerverse Node"), "node_desc": fed.get("node_desc", ""), "peers": out_peers}))
@@ -2085,7 +2409,7 @@ async def handler(websocket):
                     await websocket.send(json.dumps({"type": "error", "msg": f"World '{target}' does not exist."}))
                     continue
                 fm_changed = False
-                async with UPLOAD_LOCK:
+                async with UPLOAD_LOCK, META_LOCK:
                     meta = load_world_meta()
                     w_entry = meta.get(target, {})
                     if not (client_state["role"] == "admin" or w_entry.get("owner") == client_state["pubkey"]):
@@ -2208,89 +2532,91 @@ async def handler(websocket):
             elif msg_type == "friend_action":
                 action = str(data.get("action", ""))
                 my_key = client_state["pubkey"]
-                fdata = load_friends()
-                fdata.setdefault("friends", {}).setdefault(my_key, [])
-                fdata.setdefault("pending", {}).setdefault(my_key, [])
-                nick_reg = load_perms().get("nick_registry", {})
-                online_by_key = {st["pubkey"]: (ws_p, st) for ws_p, st in CLIENTS.items()}
-                if action == "list":
-                    await websocket.send(json.dumps({
-                        "type": "friends_list",
-                        "friends": [
-                            {
-                                "short_id": fk[:8],
-                                "nick": online_by_key[fk][1]["nick"] if fk in online_by_key else nick_reg.get(fk, fk[:8]),
-                                "online": fk in online_by_key,
-                                "world": online_by_key[fk][1]["world"] if fk in online_by_key else "",
-                            }
-                            for fk in fdata["friends"][my_key]
-                        ],
-                        "pending": [
-                            {"short_id": pk[:8], "nick": online_by_key[pk][1]["nick"] if pk in online_by_key else nick_reg.get(pk, pk[:8])}
-                            for pk in fdata["pending"][my_key]
-                        ],
-                    }))
-                    continue
-                t_key, t_nick = resolve_user_key(str(data.get("target", "")), fdata, my_key)
-                if not t_key or t_key == my_key:
-                    await websocket.send(json.dumps({"type": "error", "msg": "User not found or ambiguous."}))
-                    continue
-                fdata["friends"].setdefault(t_key, [])
-                fdata["pending"].setdefault(t_key, [])
-                if action == "add" and t_key not in fdata["friends"][my_key]:
-                    if len(fdata["friends"][my_key]) >= MAX_FRIENDS_PER_USER:
-                        await websocket.send(json.dumps({"type": "error", "msg": "Friends list limit reached."}))
+                async with FRIEND_LOCK:
+                    fdata = load_friends()
+                    fdata.setdefault("friends", {}).setdefault(my_key, [])
+                    fdata.setdefault("pending", {}).setdefault(my_key, [])
+                    nick_reg = load_perms().get("nick_registry", {})
+                    online_by_key = {st["pubkey"]: (ws_p, st) for ws_p, st in CLIENTS.items()}
+                    if action == "list":
+                        await websocket.send(json.dumps({
+                            "type": "friends_list",
+                            "friends": [
+                                {
+                                    "short_id": fk[:8],
+                                    "nick": online_by_key[fk][1]["nick"] if fk in online_by_key else nick_reg.get(fk, fk[:8]),
+                                    "online": fk in online_by_key,
+                                    "world": online_by_key[fk][1]["world"] if fk in online_by_key else "",
+                                }
+                                for fk in fdata["friends"][my_key]
+                            ],
+                            "pending": [
+                                {"short_id": pk[:8], "nick": online_by_key[pk][1]["nick"] if pk in online_by_key else nick_reg.get(pk, pk[:8])}
+                                for pk in fdata["pending"][my_key]
+                            ],
+                        }))
                         continue
-                    if t_key in fdata["pending"][my_key]:
-                        _link_mutual_friends(fdata, my_key, t_key)
-                    elif my_key not in fdata["pending"][t_key]:
-                        if len(fdata["pending"][t_key]) >= MAX_PENDING_PER_USER:
-                            await websocket.send(json.dumps({"type": "error", "msg": "Recipient pending request inbox is full."}))
+                    t_key, t_nick = resolve_user_key(str(data.get("target", "")), fdata, my_key)
+                    if not t_key or t_key == my_key:
+                        await websocket.send(json.dumps({"type": "error", "msg": "User not found or ambiguous."}))
+                        continue
+                    fdata["friends"].setdefault(t_key, [])
+                    fdata["pending"].setdefault(t_key, [])
+                    if action == "add" and t_key not in fdata["friends"][my_key]:
+                        if len(fdata["friends"][my_key]) >= MAX_FRIENDS_PER_USER:
+                            await websocket.send(json.dumps({"type": "error", "msg": "Friends list limit reached."}))
                             continue
-                        fdata["pending"][t_key].append(my_key)
-                    save_friends(fdata)
-                    await websocket.send(json.dumps({"type": "info", "msg": f"Updated friend status with {t_nick}."}))
-                elif action == "accept" and t_key in fdata["pending"][my_key]:
-                    _link_mutual_friends(fdata, my_key, t_key)
-                    save_friends(fdata)
-                    await websocket.send(json.dumps({"type": "info", "msg": f"You and {t_nick} are now friends!"}))
-                elif action == "remove":
-                    fdata["friends"][my_key] = [k for k in fdata["friends"][my_key] if k != t_key]
-                    fdata["friends"][t_key] = [k for k in fdata["friends"][t_key] if k != my_key]
-                    save_friends(fdata)
-                    await websocket.send(json.dumps({"type": "info", "msg": f"Removed {t_nick} from friends."}))
-                elif action == "whisper" and t_key in fdata["friends"][my_key] and t_key in online_by_key:
-                    pm_text = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("text", "")))[:300].strip()
-                    if pm_text:
-                        _, t_st_w = online_by_key[t_key]
-                        pkt = {
-                            "type": "whisper",
-                            "from_id": client_state["short_id"],
-                            "from_nick": client_state["nick"],
-                            "from_role": client_state["role"],
-                            "from_rank_prefix": format_rank_prefix(client_state["role"]),
-                            "to_id": t_st_w["short_id"],
-                            "to_nick": t_st_w["nick"],
-                            "to_role": t_st_w["role"],
-                            "to_rank_prefix": format_rank_prefix(t_st_w["role"]),
-                            "text": pm_text,
-                        }
-                        await online_by_key[t_key][0].send(json.dumps({**pkt, "incoming": True}))
-                        await websocket.send(json.dumps({**pkt, "incoming": False}))
-                elif action == "goto" and t_key in fdata["friends"][my_key] and t_key in online_by_key:
-                    _, t_st = online_by_key[t_key]
-                    dest_w = t_st["world"]
-                    dest_meta = load_world_meta().get(dest_w, {})
-                    if not can_visit_world(dest_w, dest_meta, my_key, client_state["role"]):
-                        await websocket.send(json.dumps({"type": "error", "msg": f"{t_nick} is in a private world."}))
-                        continue
-                    if client_state["world"] != dest_w:
-                        old_w = client_state["world"]
-                        client_state["world"] = dest_w
-                        await broadcast_world(old_w, {"type": "peer_leave", "short_id": client_state["short_id"]}, exclude_ws=websocket)
-                        await send_world_transition(websocket, client_state, dest_w, dest_meta)
-                    fx, fy, fz = t_st["pos"]
-                    await websocket.send(json.dumps({"type": "teleport", "pos": [round(fx, 2), round(fy + 2.0, 2), round(fz + 3.0, 2)], "msg": f"Teleported to {t_nick}."}))
+                        if t_key in fdata["pending"][my_key]:
+                            _link_mutual_friends(fdata, my_key, t_key)
+                        elif my_key not in fdata["pending"][t_key]:
+                            if len(fdata["pending"][t_key]) >= MAX_PENDING_PER_USER:
+                                await websocket.send(json.dumps({"type": "error", "msg": "Recipient pending request inbox is full."}))
+                                continue
+                            fdata["pending"][t_key].append(my_key)
+                        save_friends(fdata)
+                        await websocket.send(json.dumps({"type": "info", "msg": f"Updated friend status with {t_nick}."}))
+                    elif action == "accept" and t_key in fdata["pending"][my_key]:
+                        _link_mutual_friends(fdata, my_key, t_key)
+                        save_friends(fdata)
+                        await websocket.send(json.dumps({"type": "info", "msg": f"You and {t_nick} are now friends!"}))
+                    elif action == "remove":
+                        fdata["friends"][my_key] = [k for k in fdata["friends"][my_key] if k != t_key]
+                        fdata["friends"][t_key] = [k for k in fdata["friends"][t_key] if k != my_key]
+                        save_friends(fdata)
+                        await websocket.send(json.dumps({"type": "info", "msg": f"Removed {t_nick} from friends."}))
+                    elif action == "whisper" and t_key in fdata["friends"][my_key] and t_key in online_by_key:
+                        pm_text = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("text", "")))[:300].strip()
+                        if pm_text:
+                            _, t_st_w = online_by_key[t_key]
+                            pkt = {
+                                "type": "whisper",
+                                "from_id": client_state["short_id"],
+                                "from_nick": client_state["nick"],
+                                "from_role": client_state["role"],
+                                "from_rank_prefix": format_rank_prefix(client_state["role"]),
+                                "to_id": t_st_w["short_id"],
+                                "to_nick": t_st_w["nick"],
+                                "to_role": t_st_w["role"],
+                                "to_rank_prefix": format_rank_prefix(t_st_w["role"]),
+                                "text": pm_text,
+                            }
+                            await online_by_key[t_key][0].send(json.dumps({**pkt, "incoming": True}))
+                            await websocket.send(json.dumps({**pkt, "incoming": False}))
+                    elif action == "goto" and t_key in fdata["friends"][my_key] and t_key in online_by_key:
+                        _, t_st = online_by_key[t_key]
+                        dest_w = t_st["world"]
+                        dest_meta = load_world_meta().get(dest_w, {})
+                        if not can_visit_world(dest_w, dest_meta, my_key, client_state["role"]):
+                            await websocket.send(json.dumps({"type": "error", "msg": f"{t_nick} is in a private world."}))
+                            continue
+                        if client_state["world"] != dest_w:
+                            old_w = client_state["world"]
+                            client_state["world"] = dest_w
+                            await broadcast_world(old_w, {"type": "peer_leave", "short_id": client_state["short_id"]}, exclude_ws=websocket)
+                            await send_world_transition(websocket, client_state, dest_w, dest_meta)
+                        fx, fy, fz = t_st["pos"]
+                        await websocket.send(json.dumps({"type": "teleport", "pos": [round(fx, 2), round(fy + 2.0, 2), round(fz + 3.0, 2)], "msg": f"Teleported to {t_nick}."}))
+
 
             elif msg_type == "prefab_action":
                 action = str(data.get("action", "list")).strip().lower()
@@ -2388,6 +2714,19 @@ async def handler(websocket):
                         await broadcast_world(target_w, _build_world_data_packet(target_w, updated_md, w_entry, in_place=True))
                     await websocket.send(json.dumps({"type": "info", "msg": f"Stamped blueprint '{p_name}' [{tid}] into '{target_w}'."}))
 
+                elif action == "delete":
+                    raw_pn = str(data.get("name", "")).strip()
+                    p_name = sanitize_name(raw_pn)
+                    p_path = _safe_child_path(PREFABS_DIR, f"{p_name}.md")
+                    if not raw_pn or not p_name or p_path is None or not p_path.exists():
+                        await websocket.send(json.dumps({"type": "error", "msg": f"Blueprint '{p_name or raw_pn}' not found."}))
+                        continue
+                    async with UPLOAD_LOCK:
+                        if p_path.exists():
+                            p_path.unlink()
+                        names = sorted(p.stem for p in PREFABS_DIR.glob("*.md"))
+                    await websocket.send(json.dumps({"type": "prefab_deleted", "name": p_name, "prefabs": names}))
+
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -2403,7 +2742,7 @@ async def main():
     if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
         print(
             "Makerverse #MV3D Server\n"
-            "Usage: python server.py [--data-dir PATH] [--host ADDR] [--port PORT]"
+            "Usage: python server.py [--data-dir PATH] [--host ADDR] [--port PORT] [--status-port PORT]"
         )
         return
     configure_server_storage(_resolve_server_data_dir(sys.argv[1:]))
@@ -2433,6 +2772,14 @@ async def main():
             p_v = tok.split("=", 1)[1].strip()
             if p_v.isdigit() and 1 <= int(p_v) <= 65535:
                 eff_cfg["port"] = int(p_v)
+        elif tok == "--status-port":
+            sp_v = next(args_iter, "").strip()
+            if sp_v.isdigit() and 0 <= int(sp_v) <= 65535:
+                eff_cfg["status_port"] = int(sp_v)
+        elif tok.startswith("--status-port="):
+            sp_v = tok.split("=", 1)[1].strip()
+            if sp_v.isdigit() and 0 <= int(sp_v) <= 65535:
+                eff_cfg["status_port"] = int(sp_v)
     apply_runtime_server_config(eff_cfg)
     load_server_plugins()
     ensure_hub_world()
@@ -2442,9 +2789,17 @@ async def main():
     load_federation()
     mp_lbl = eff_cfg["max_players"] if eff_cfg["max_players"] > 0 else "unlimited"
     mw_lbl = eff_cfg["max_total_worlds"] if eff_cfg["max_total_worlds"] > 0 else "unlimited"
+    status_srv = await start_status_http_server(HOST, STATUS_PORT)
+    if status_srv is not None:
+        print(f"[*] Public Node Directory & Status Page at http://{HOST}:{STATUS_PORT}/ (JSON: /status.json)")
     print(f"[*] Makerverse (#MV3D) v2 Server running on ws://{HOST}:{PORT} (data: {DATA_DIR}, max_players={mp_lbl}, max_worlds={mw_lbl})")
-    async with websockets.serve(handler, HOST, PORT, max_size=MAX_FILE_SIZE + 65536, ping_interval=20, ping_timeout=20):
-        await asyncio.Future()
+    try:
+        async with websockets.serve(handler, HOST, PORT, max_size=MAX_FILE_SIZE + 65536, ping_interval=20, ping_timeout=20):
+            await asyncio.Future()
+    finally:
+        if status_srv is not None:
+            status_srv.close()
+            await status_srv.wait_closed()
 
 
 if __name__ == "__main__":

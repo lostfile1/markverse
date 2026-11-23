@@ -1,7 +1,10 @@
 import hashlib
+import ipaddress
 import math
 import re
 import secrets
+import socket
+import urllib.parse
 
 MAX_SCENE_OBJECTS = 4096
 MAX_NESTING_DEPTH = 12
@@ -247,11 +250,6 @@ def _rot_list_to_quat(rot_val):
     return (0.0, 0.0, 0.0, 1.0)
 
 
-import ipaddress
-import socket
-import urllib.parse
-
-
 def is_safe_media_url(url: str, allow_unresolvable: bool = False) -> tuple[bool, str]:
     raw = str(url or "").strip()
     if not raw or len(raw) > 500 or any(ch in raw for ch in ('"', "'", "\n", "\r", "\x00", " ")):
@@ -303,7 +301,6 @@ def is_safe_media_url(url: str, allow_unresolvable: bool = False) -> tuple[bool,
 
 
 def normalize_media_embed_url(url: str) -> tuple[str, str]:
-    """Returns (embed_or_watch_url, detected_type) where detected_type is 'youtube' or 'web'."""
     raw = str(url or "").strip()
     ok, _ = is_safe_media_url(raw, allow_unresolvable=True)
     if not ok:
@@ -361,9 +358,6 @@ def normalize_expression_name(raw_expr: str) -> str:
 
 
 def parse_mv3d(md_text: str) -> dict:
-    """Single-pass hardened parser for Makerverse 3D Markdown (#MV3D) worlds and avatars.
-    Supports portals, interactive triggers, 3D sign billboards, sky/fog, radio, and @def/@use templates.
-    """
     scene = {
         "title": "",
         "bg": (0.04, 0.01, 0.12),
@@ -631,7 +625,6 @@ def parse_mv3d(md_text: str) -> dict:
                 "yaw": target_yaw,
                 "server": target_server,
             })
-            # Visual beacon ring/box for portal (non-solid for physics, raycastable in inspect mode)
             scene["objects"].append({
                 "kind": "cylinder",
                 "pos": portal_xyz,
@@ -831,11 +824,11 @@ def parse_mv3d(md_text: str) -> dict:
                     r_pos, r_quat, r_scale = cur["local_pos"], cur["local_quat"], cur["local_scale"]
                 else:
                     r_pos, r_quat, r_scale = _relative_to_ancestor(cur, def_anc)
-                    r_pos = (
-                        def_anc["local_pos"][0] + r_pos[0],
-                        def_anc["local_pos"][1] + r_pos[1],
-                        def_anc["local_pos"][2] + r_pos[2],
-                    )
+                r_pos = (
+                    def_anc["local_pos"][0] + r_pos[0],
+                    def_anc["local_pos"][1] + r_pos[1],
+                    def_anc["local_pos"][2] + r_pos[2],
+                )
                 def_anc["records"].append({
                     **obj,
                     "rel_pos": r_pos,
@@ -916,6 +909,50 @@ def update_mv3d_frontmatter(md_text: str, updates: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def prune_unused_defs_md(md_text: str) -> tuple[str, int]:
+    clean = md_text.lstrip("\ufeff").replace("\r\n", "\n")
+    used_names = set(re.findall(r"[-*+]\s+\*\*@use\*\*\s*:\s*([A-Za-z0-9_-]+)", clean, re.I))
+    lines = clean.splitlines()
+    out_lines: list[str] = []
+    pruned = 0
+    idx = 0
+    in_frontmatter = False
+    while idx < len(lines):
+        ln = lines[idx]
+        st = ln.strip()
+        if idx == 0 and st == "---":
+            in_frontmatter = True
+            out_lines.append(ln)
+            idx += 1
+            continue
+        if in_frontmatter:
+            if st == "---":
+                in_frontmatter = False
+            out_lines.append(ln)
+            idx += 1
+            continue
+        m_def = re.match(r"^(#{1,6})\s+@def\s+([A-Za-z0-9_-]+)\s*$", st)
+        if m_def:
+            def_depth = len(m_def.group(1))
+            def_name = m_def.group(2)
+            end_i = idx + 1
+            while end_i < len(lines):
+                hm = re.match(r"^(#{1,6})\s+", lines[end_i].strip())
+                if hm and len(hm.group(1)) <= def_depth:
+                    break
+                end_i += 1
+            if def_name not in used_names:
+                pruned += 1
+                while end_i < len(lines) and not lines[end_i].strip():
+                    end_i += 1
+                idx = end_i
+                continue
+        out_lines.append(ln)
+        idx += 1
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip() + "\n"
+    return cleaned, pruned
+
+
 def build_placed_mv3d_snippet(
     shape: str,
     x: float,
@@ -944,15 +981,15 @@ def build_placed_mv3d_snippet(
             f"* **pos**: [{x:.3f}, {y:.3f}, {z:.3f}]\n"
             f"* **rot**: [0, {yaw}, 0]\n"
             f"* **scale**: [1.0, 1.0, 1.0]\n"
-            f"  ## Part: LeftPost\n"
-            f"  * **pos**: [{-1.6 * s:.3f}, {1.8 * s:.3f}, 0]\n"
-            f'  * **cylinder**: {{ radius: {0.25 * s:.3f}, height: {3.6 * s:.3f}, color: "{c_hex}", glow: "{g_hex}" }}\n'
-            f"  ## Part: RightPost\n"
-            f"  * **pos**: [{1.6 * s:.3f}, {1.8 * s:.3f}, 0]\n"
-            f'  * **cylinder**: {{ radius: {0.25 * s:.3f}, height: {3.6 * s:.3f}, color: "{c_hex}", glow: "{g_hex}" }}\n'
-            f"  ## Part: Lintel\n"
-            f"  * **pos**: [0, {3.75 * s:.3f}, 0]\n"
-            f'  * **box**: {{ size: [{3.8 * s:.3f}, {0.35 * s:.3f}, {0.8 * s:.3f}], color: "{c_hex}", glow: "{c_hex}" }}'
+            f" ## Part: LeftPost\n"
+            f" * **pos**: [{-1.6 * s:.3f}, {1.8 * s:.3f}, 0]\n"
+            f' * **cylinder**: {{ radius: {0.25 * s:.3f}, height: {3.6 * s:.3f}, color: "{c_hex}", glow: "{g_hex}" }}\n'
+            f" ## Part: RightPost\n"
+            f" * **pos**: [{1.6 * s:.3f}, {1.8 * s:.3f}, 0]\n"
+            f' * **cylinder**: {{ radius: {0.25 * s:.3f}, height: {3.6 * s:.3f}, color: "{c_hex}", glow: "{g_hex}" }}\n'
+            f" ## Part: Lintel\n"
+            f" * **pos**: [0, {3.75 * s:.3f}, 0]\n"
+            f' * **box**: {{ size: [{3.8 * s:.3f}, {0.35 * s:.3f}, {0.8 * s:.3f}], color: "{c_hex}", glow: "{c_hex}" }}'
         )
 
     if shape == "pillar":
@@ -1003,7 +1040,7 @@ def build_placed_portal_snippet(
     yaw = round(_finite_float(yaw_deg, 0.0) % 360.0, 1)
 
     fields = [f'to: "{safe_dest}"', f"radius: {rad}", f'color: "{c_hex}"']
-    clean_srv = re.sub(r'[\x00-\x1f\x7f"\'\\\s]', "", str(target_server or ""))[:200]
+    clean_srv = re.sub(r'[\x00-\x1f\x7f"\\\s]', "", str(target_server or ""))[:200]
     if clean_srv:
         fields.append(f'server: "{clean_srv}"')
     if isinstance(target_spawn, (list, tuple)) and len(target_spawn) >= 3:
@@ -1029,7 +1066,6 @@ def _find_placed_md_span(md_text: str, target_tag_id: str) -> tuple[int, int, st
     raw_tok = str(target_tag_id or "").strip()
     if not raw_tok:
         return None
-
     clean_hex = re.sub(r"[^a-fA-F0-9]", "", raw_tok).lower()
     if clean_hex and re.fullmatch(r"[0-9a-fA-F]{4,8}", raw_tok):
         m = re.search(rf"<!--\s*PLACED:({re.escape(clean_hex)})\b[^>]*-->", md_text, re.I)
@@ -1041,11 +1077,9 @@ def _find_placed_md_span(md_text: str, target_tag_id: str) -> tuple[int, int, st
             nxt = re.search(r"\n(?=#\s+|<!--\s*PLACED:)", rest[search_from:])
             end_idx = m.end() + search_from + nxt.start() if nxt else len(md_text)
             return start_idx, end_idx, m.group(1).lower()
-
     clean_name = re.sub(r"[^a-zA-Z0-9_:-]", "", raw_tok).lower()
     if not clean_name:
         return None
-
     lines = md_text.splitlines(keepends=True)
     body_offset = 0
     if lines and lines[0].strip() == "---":
@@ -1054,7 +1088,6 @@ def _find_placed_md_span(md_text: str, target_tag_id: str) -> tuple[int, int, st
             body_offset += len(ln)
             if ln.strip() == "---":
                 break
-
     body = md_text[body_offset:]
     hdr_matches = []
     in_def = False
@@ -1071,7 +1104,6 @@ def _find_placed_md_span(md_text: str, target_tag_id: str) -> tuple[int, int, st
             hdr_matches.append((body_offset + m_ln.start(), body_offset + m_ln.end(), depth, label, in_def))
         else:
             hdr_matches.append((body_offset + m_ln.start(), body_offset + m_ln.end(), 1, (m_ln.group(1) or "").lower(), False))
-
     for idx_h, (h_start, h_end, h_depth, h_label, h_in_def) in enumerate(hdr_matches):
         if h_in_def:
             continue
@@ -1083,8 +1115,8 @@ def _find_placed_md_span(md_text: str, target_tag_id: str) -> tuple[int, int, st
                     end_idx = nxt_start
                     break
             return h_start, end_idx, h_label
-
     return None
+
 
 def remove_placed_md_snippet(md_text: str, target_tag_id: str) -> tuple[str, bool]:
     span = _find_placed_md_span(md_text, target_tag_id)
@@ -1205,114 +1237,210 @@ def mutate_placed_md_snippet(
 
     return md_text, False, f"Unknown op '{op}'."
 
+
 def build_default_hub_md() -> str:
     lines = [
         "---",
         'title: "NEO-GENESIS GRID // HUB"',
-        'description: "Makerverse 3D Markdown Nexus - /worlds, /world <name>, /peers, /hop <node>"',
-        "tags: [hub, nexus, makerverse]",
-        'sky: ["#050f1c", "#0a2938", "#0f3d47"]',
-        'fog: { color: "#08242e", range: 155 }',
-        "spawn: { pos: [0, 2.25, 13.5], yaw: 0 }",
+        'description: "Retrofuturistic #MV3D Nexus - /worlds, /world <name>, /peers, /hop <node>"',
+        "tags: [hub, nexus, retrofuturistic, makerverse]",
+        'sky: ["#060414", "#160933", "#2b0f4a"]',
+        'fog: { color: "#120829", range: 165 }',
+        "spawn: { pos: [0, 2.25, 14.5], yaw: 0 }",
         "---",
         "",
         "# Node: GridFloor",
         "* **pos**: [0, -0.05, 0]",
-        '* **box**: { size: [160, 0.1, 160], color: "#0a121c", glow: "#030f17" }',
+        '* **box**: { size: [160, 0.1, 160], color: "#090b16", glow: "#040612" }',
+        "",
+        "# Node: CyberAvenue",
+        "* **pos**: [0, 0.01, 0]",
+        " ## Part: MainRunway",
+        " * **pos**: [0, 0.0, 9.5]",
+        ' * **box**: { size: [5.8, 0.02, 13.0], color: "#0e1528", glow: "#061a2e" }',
+        " ## Part: TrimLeft",
+        " * **pos**: [-3.05, 0.02, 9.5]",
+        ' * **box**: { size: [0.18, 0.04, 13.0], color: "#00f5d4", glow: "#00f5d4" }',
+        " ## Part: TrimRight",
+        " * **pos**: [3.05, 0.02, 9.5]",
+        ' * **box**: { size: [0.18, 0.04, 13.0], color: "#ff2a9d", glow: "#ff2a9d" }',
+        " ## Part: CrossAxisBar",
+        " * **pos**: [0, 0.015, -10.0]",
+        ' * **box**: { size: [64.0, 0.03, 0.28], color: "#00f5d4", glow: "#00a896" }',
+        " ## Part: NorthAxisBar",
+        " * **pos**: [0, 0.015, -28.0]",
+        ' * **box**: { size: [0.28, 0.03, 34.0], color: "#ff2a9d", glow: "#b5179e" }',
         "",
         "# Node: CommandDais",
         "* **pos**: [0, 0, -10]",
-        "  ## Part: LowerTier",
-        "  * **pos**: [0, 0.35, 0]",
-        '  * **box**: { size: [22.0, 0.7, 22.0], color: "#141f2e", glow: "#05242e" }',
-        "  ## Part: UpperTier",
-        "  * **pos**: [0, 1.05, 0]",
-        '  * **box**: { size: [17.5, 0.7, 17.5], color: "#1a2638", glow: "#082e3d" }',
-        "  ## Part: ObeliskBase",
-        "  * **pos**: [0, 2.0, 0]",
-        '  * **box**: { size: [3.2, 1.2, 3.2], color: "#142433", glow: "#00738c" }',
-        "  ## Part: ObeliskSpire",
-        "  * **pos**: [0, 6.8, 0]",
-        '  * **box**: { size: [1.65, 8.6, 1.65], color: "#00f2eb", glow: "#00f2eb" }',
-        "  ## Part: ObeliskCrown",
-        "  * **pos**: [0, 12.4, 0]",
-        '  * **cone**: { radius: 1.18, height: 2.6, color: "#1affff", glow: "#1affff" }',
+        " ## Part: LowerTier",
+        " * **pos**: [0, 0.35, 0]",
+        ' * **box**: { size: [22.0, 0.7, 22.0], color: "#11162b", glow: "#091533" }',
+        " ## Part: LowerNeonTrim",
+        " * **pos**: [0, 0.71, 0]",
+        ' * **box**: { size: [22.25, 0.08, 22.25], color: "#ff2a9d", glow: "#ff2a9d" }',
+        " ## Part: UpperTier",
+        " * **pos**: [0, 1.05, 0]",
+        ' * **box**: { size: [17.5, 0.7, 17.5], color: "#161d38", glow: "#0c1f42" }',
+        " ## Part: UpperNeonTrim",
+        " * **pos**: [0, 1.41, 0]",
+        ' * **box**: { size: [17.75, 0.08, 17.75], color: "#00f5d4", glow: "#00f5d4" }',
+        " ## Part: ObeliskPlinth",
+        " * **pos**: [0, 1.75, 0]",
+        ' * **box**: { size: [4.6, 0.7, 4.6], color: "#0f172a", glow: "#062c43" }',
+        " ## Part: ObeliskBase",
+        " * **pos**: [0, 2.5, 0]",
+        ' * **box**: { size: [3.2, 1.2, 3.2], color: "#14213d", glow: "#0077b6" }',
+        " ## Part: ObeliskSpire",
+        " * **pos**: [0, 7.1, 0]",
+        ' * **box**: { size: [1.55, 8.0, 1.55], color: "#00f5d4", glow: "#00d4ff" }',
+        " ## Part: ObeliskCoreBand",
+        " * **pos**: [0, 7.1, 0]",
+        ' * **box**: { size: [1.82, 0.45, 1.82], color: "#ff2a9d", glow: "#ff2a9d" }',
+        " ## Part: ObeliskCrown",
+        " * **pos**: [0, 12.3, 0]",
+        ' * **cone**: { radius: 1.25, height: 2.4, color: "#ffbe0b", glow: "#ff7b00" }',
         "",
         "# Node: EntranceStairs",
     ]
-    for idx, (sy, sz) in enumerate(((0.18, 2.6), (0.52, 1.6), (0.88, 0.6), (1.22, -0.4))):
+    for idx, (sy, sz) in enumerate(((0.175, 2.8), (0.525, 1.7), (0.875, 0.6), (1.225, -0.5))):
+        trim_col = "#00f5d4" if idx % 2 == 0 else "#ff2a9d"
         lines.extend([
-            f"  ## Part: Step_{idx}",
-            f"  * **pos**: [0, {sy}, {sz}]",
-            '  * **box**: { size: [4.6, 0.36, 1.2], color: "#1c293b", glow: "#083b4a" }',
+            f" ## Part: Step_{idx}",
+            f" * **pos**: [0, {sy}, {sz}]",
+            ' * **box**: { size: [5.6, 0.35, 1.4], color: "#161f38", glow: "#0a1936" }',
+            f" ## Part: StepGlow_{idx}",
+            f" * **pos**: [0, {round(sy + 0.18, 3)}, {round(sz + 0.66, 3)}]",
+            f' * **box**: {{ size: [5.64, 0.05, 0.08], color: "{trim_col}", glow: "{trim_col}" }}',
         ])
-
+    lines.extend([
+        " ## Part: StairRailLeft",
+        " * **pos**: [-2.95, 0.85, 1.15]",
+        " * **rot**: [18.5, 0, 0]",
+        ' * **box**: { size: [0.22, 0.24, 5.2], color: "#00f5d4", glow: "#00a896" }',
+        " ## Part: StairRailRight",
+        " * **pos**: [2.95, 0.85, 1.15]",
+        " * **rot**: [18.5, 0, 0]",
+        ' * **box**: { size: [0.22, 0.24, 5.2], color: "#ff2a9d", glow: "#b5179e" }',
+        "",
+        "# @def CyberArchGate",
+        " ## Part: LeftColumn",
+        " * **pos**: [-3.4, 2.6, 0]",
+        ' * **box**: { size: [0.65, 5.2, 0.65], color: "#131b33", glow: "#091836" }',
+        " ## Part: LeftStrip",
+        " * **pos**: [-3.4, 2.6, 0.35]",
+        ' * **box**: { size: [0.14, 4.8, 0.08], color: "#00f5d4", glow: "#00f5d4" }',
+        " ## Part: RightColumn",
+        " * **pos**: [3.4, 2.6, 0]",
+        ' * **box**: { size: [0.65, 5.2, 0.65], color: "#131b33", glow: "#091836" }',
+        " ## Part: RightStrip",
+        " * **pos**: [3.4, 2.6, 0.35]",
+        ' * **box**: { size: [0.14, 4.8, 0.08], color: "#ff2a9d", glow: "#ff2a9d" }',
+        " ## Part: CrossBeam",
+        " * **pos**: [0, 5.45, 0]",
+        ' * **box**: { size: [7.8, 0.55, 0.85], color: "#1a2240", glow: "#10254a" }',
+        " ## Part: BeamNeon",
+        " * **pos**: [0, 5.78, 0]",
+        ' * **box**: { size: [7.9, 0.12, 0.9], color: "#ffbe0b", glow: "#ff9e00" }',
+        "",
+        "# Node: PlazaGates",
+        " ## Part: SouthEntranceGate",
+        " * **pos**: [0, 0, 5.8]",
+        " * **@use**: CyberArchGate",
+        " ## Part: NorthPortalGate",
+        " * **pos**: [0, 0, -24.5]",
+        " * **@use**: CyberArchGate",
+        "",
+        "# Node: RetroHorizonMonolith",
+        "* **pos**: [0, 0, -48.0]",
+    ])
+    sun_bands = [
+        (3.5, 18.0, 1.6, "#ffbe0b"),
+        (6.0, 22.0, 1.8, "#ff9e00"),
+        (8.8, 24.5, 2.0, "#ff5400"),
+        (11.8, 25.5, 2.1, "#ff2a9d"),
+        (14.9, 24.0, 2.0, "#b5179e"),
+        (17.8, 20.5, 1.7, "#7209b7"),
+        (20.3, 15.0, 1.3, "#00f5d4"),
+    ]
+    for b_idx, (by, bw, bh, bcol) in enumerate(sun_bands):
+        lines.extend([
+            f" ## Part: HorizonBar_{b_idx}",
+            f" * **pos**: [0, {by}, 0]",
+            f' * **box**: {{ size: [{bw}, {bh}, 0.6], color: "{bcol}", glow: "{bcol}" }}',
+        ])
     lines.extend([
         "",
         "# @def SkylineTower",
-        '* **box**: { size: [6.5, 24.0, 6.5], color: "#0d1421", glow: "#050f1a" }',
-        "  ## Part: NeonCrown",
-        "  * **pos**: [0, 10.5, 0]",
-        '  * **box**: { size: [6.9, 0.55, 6.9], color: "#00c8d9", glow: "#00c8d9" }',
+        '* **box**: { size: [6.4, 24.0, 6.4], color: "#0c1022", glow: "#060a1a" }',
+        " ## Part: MidBand",
+        " * **pos**: [0, 2.0, 0]",
+        ' * **box**: { size: [6.75, 0.45, 6.75], color: "#ff2a9d", glow: "#ff2a9d" }',
+        " ## Part: NeonCrown",
+        " * **pos**: [0, 10.6, 0]",
+        ' * **box**: { size: [6.85, 0.55, 6.85], color: "#00f5d4", glow: "#00f5d4" }',
+        " ## Part: SpireMast",
+        " * **pos**: [0, 14.2, 0]",
+        ' * **cylinder**: { radius: 0.16, height: 4.4, color: "#ffbe0b", glow: "#ff9e00" }',
         "",
         "# Node: SkylineRing",
     ])
-    for i, (tx, tz) in enumerate(((-28, -34), (-16.5, -38), (16.5, -38), (29, -32), (-34, -12), (34, -10))):
+    for i, (tx, tz) in enumerate(((-30, -36), (-17.5, -41), (17.5, -41), (30, -36), (-36, -12), (36, -12), (-32, 14), (32, 14))):
         lines.extend([
-            f"  ## Part: Tower_{i}",
-            f"  * **pos**: [{tx}, 12.0, {tz}]",
-            "  * **@use**: SkylineTower",
+            f" ## Part: Tower_{i}",
+            f" * **pos**: [{tx}, 12.0, {tz}]",
+            " * **@use**: SkylineTower",
         ])
-
     lines.append("\n# Node: HaloOrbs")
     for orb_i in range(16):
         ang = (2.0 * math.pi * orb_i) / 16.0
-        ox = round(math.cos(ang) * 3.2, 3)
-        oz = round(-10.0 + math.sin(ang) * 3.2, 3)
+        ox = round(math.cos(ang) * 3.5, 3)
+        oz = round(-10.0 + math.sin(ang) * 3.5, 3)
+        orb_col = "#ff2a9d" if orb_i % 2 == 0 else "#00f5d4"
         lines.extend([
-            f"  ## Part: Orb_{orb_i}",
-            f"  * **pos**: [{ox}, 14.8, {oz}]",
-            '  * **sphere**: { radius: 0.22, color: "#ff26d1", glow: "#ff26d1" }',
+            f" ## Part: Orb_{orb_i}",
+            f" * **pos**: [{ox}, 13.9, {oz}]",
+            f' * **sphere**: {{ radius: 0.36, color: "{orb_col}", glow: "{orb_col}" }}',
         ])
-
+    for low_i in range(8):
+        ang_l = (2.0 * math.pi * low_i) / 8.0 + (math.pi / 8.0)
+        lx = round(math.cos(ang_l) * 2.65, 3)
+        lz = round(-10.0 + math.sin(ang_l) * 2.65, 3)
+        lines.extend([
+            f" ## Part: InnerBeacon_{low_i}",
+            f" * **pos**: [{lx}, 8.6, {lz}]",
+            ' * **sphere**: { radius: 0.28, color: "#ffbe0b", glow: "#ff9e00" }',
+        ])
+    lines.extend([
+        "",
+        "# Node: DaisCornerCrystals",
+    ])
+    for c_idx, (cx, cz, c_col) in enumerate(((-7.5, -17.5, "#00f5d4"), (7.5, -17.5, "#ff2a9d"), (-7.5, -2.5, "#ff2a9d"), (7.5, -2.5, "#00f5d4"))):
+        lines.extend([
+            f" ## Part: Crystal_{c_idx}",
+            f" * **pos**: [{cx}, 3.1, {cz}]",
+            f' * **cone**: {{ radius: 0.68, height: 2.6, color: "{c_col}", glow: "{c_col}" }}',
+        ])
     lines.extend([
         "",
         "# Node: NexusSign",
-        "* **pos**: [0, 3.6, -5.5]",
-        '* **sign**: { text: "MAKERVERSE NEXUS", color: "#00ffd9", glow: "#006655" }',
+        "* **pos**: [0, 6.45, 5.8]",
+        '* **sign**: { text: "MAKERVERSE // NEO-GENESIS NEXUS", color: "#00f5d4", glow: "#007766" }',
     ])
     return "\n".join(lines) + "\n"
 
+
 TEMPLATE_ALIASES = {
-    "flat": "flat",
-    "grid": "flat",
-    "blank": "flat",
-    "cybercity": "cybercity",
-    "cyber": "cybercity",
-    "city": "cybercity",
-    "forest": "forest",
-    "pine": "forest",
-    "woods": "forest",
-    "desert": "desert",
-    "dunes": "desert",
-    "sand": "desert",
-    "crystal": "crystal",
-    "crystals": "crystal",
-    "arctic": "crystal",
-    "arctic_crystal": "crystal",
-    "arctic-crystal": "crystal",
-    "arcticcrystal": "crystal",
-    "ice": "crystal",
-    "cavern": "crystal",
-    "fortress": "fortress",
-    "citadel": "fortress",
-    "castle": "fortress",
-    "island": "island",
-    "atoll": "island",
-    "tropical": "island",
-    "space": "space",
-    "station": "space",
-    "orbit": "space",
+    "flat": "flat", "grid": "flat", "blank": "flat",
+    "cybercity": "cybercity", "cyber": "cybercity", "city": "cybercity",
+    "forest": "forest", "pine": "forest", "woods": "forest",
+    "desert": "desert", "dunes": "desert", "sand": "desert",
+    "crystal": "crystal", "crystals": "crystal", "arctic": "crystal",
+    "arctic_crystal": "crystal", "arctic-crystal": "crystal", "arcticcrystal": "crystal",
+    "ice": "crystal", "cavern": "crystal",
+    "fortress": "fortress", "citadel": "fortress", "castle": "fortress",
+    "island": "island", "atoll": "island", "tropical": "island",
+    "space": "space", "station": "space", "orbit": "space",
 }
 
 
@@ -1339,8 +1467,8 @@ def resolve_world_template_key(template_key: str) -> str:
 def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: str = "") -> str:
     tkey = resolve_world_template_key(template_key)
     tmeta = WORLD_TEMPLATES[tkey]
-    title_str = re.sub(r'[\\"\r\n\x00]', " ", " ".join(str(tmeta["label"] or world_name).split())).strip()[:64]
-    desc_str = re.sub(r'[\\"\r\n\x00]', " ", " ".join(str(custom_desc or tmeta["desc"]).split())).strip()[:200]
+    title_str = re.sub(r'[\"\r\n\x00]', " ", " ".join(str(tmeta["label"] or world_name).split())).strip()[:64]
+    desc_str = re.sub(r'[\"\r\n\x00]', " ", " ".join(str(custom_desc or tmeta["desc"]).split())).strip()[:200]
     seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(f"{world_name}:{tkey}")) or 42
 
     themes = {
@@ -1374,9 +1502,9 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
     ]
     if tkey == "flat":
         lines.extend([
-            "  ## Part: SpawnPad",
-            "  * **pos**: [0, 0.08, 0]",
-            '  * **box**: { size: [10, 0.16, 10], color: "#142438", glow: "#053342" }',
+            " ## Part: SpawnPad",
+            " * **pos**: [0, 0.08, 0]",
+            ' * **box**: { size: [10, 0.16, 10], color: "#142438", glow: "#053342" }',
         ])
     elif tkey == "crystal":
         for idx in range(16):
@@ -1389,15 +1517,14 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
             h = round(3.8 + ((idx * 5 + seed) % 9), 2)
             r_base = round(max(0.65, h * 0.34), 2)
             col = acc1 if idx % 2 == 0 else acc2
-            glow_c = col
-            lines.append(f"  ## Part: CrystalSpire_{idx}")
-            lines.append(f"  * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
-            lines.append(f'  * **cone**: {{ radius: {r_base}, height: {h}, color: "{col}", glow: "{glow_c}" }}')
+            lines.append(f" ## Part: CrystalSpire_{idx}")
+            lines.append(f" * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
+            lines.append(f' * **cone**: {{ radius: {r_base}, height: {h}, color: "{col}", glow: "{col}" }}')
         for c_i, (cx, cz, ch) in enumerate(((-5.5, 2.0, 5.2), (5.5, 2.0, 5.8), (0.0, -7.5, 7.6))):
             c_col = acc1 if c_i % 2 == 0 else acc2
-            lines.append(f"  ## Part: CavernCluster_{c_i}")
-            lines.append(f"  * **pos**: [{cx}, {ch * 0.5:.2f}, {cz}]")
-            lines.append(f'  * **cone**: {{ radius: {round(ch * 0.32, 2)}, height: {ch}, color: "{c_col}", glow: "{c_col}" }}')
+            lines.append(f" ## Part: CavernCluster_{c_i}")
+            lines.append(f" * **pos**: [{cx}, {ch * 0.5:.2f}, {cz}]")
+            lines.append(f' * **cone**: {{ radius: {round(ch * 0.32, 2)}, height: {ch}, color: "{c_col}", glow: "{c_col}" }}')
     else:
         for idx in range(14):
             ang = (2.0 * math.pi * idx) / 14.0
@@ -1406,27 +1533,27 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
             z = round(math.sin(ang) * rad - 4.0, 2)
             h = round(3.2 + ((idx * 5 + seed) % 9), 2)
             col = acc1 if idx % 2 == 0 else acc2
-            lines.append(f"  ## Part: Prop_{idx}")
+            lines.append(f" ## Part: Prop_{idx}")
             if tkey in ("forest", "desert"):
-                lines.append(f"  * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
-                lines.append(f'  * **cone**: {{ radius: {round(h * 0.45, 2)}, height: {h}, color: "{col}", glow: "{acc1}" }}')
+                lines.append(f" * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
+                lines.append(f' * **cone**: {{ radius: {round(h * 0.45, 2)}, height: {h}, color: "{col}", glow: "{acc1}" }}')
             elif tkey == "space":
-                lines.append(f"  * **pos**: [{x}, {round(2.5 + (idx % 4) * 1.6, 2)}, {z}]")
-                lines.append(f'  * **sphere**: {{ radius: {round(1.1 + (idx % 3) * 0.5, 2)}, color: "{col}", glow: "{col}" }}')
+                lines.append(f" * **pos**: [{x}, {round(2.5 + (idx % 4) * 1.6, 2)}, {z}]")
+                lines.append(f' * **sphere**: {{ radius: {round(1.1 + (idx % 3) * 0.5, 2)}, color: "{col}", glow: "{col}" }}')
             else:
                 w = round(2.4 + ((idx + seed) % 3) * 0.9, 2)
-                lines.append(f"  * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
-                lines.append(f'  * **box**: {{ size: [{w}, {h}, {w}], color: "{col}", glow: "#080c14" }}')
+                lines.append(f" * **pos**: [{x}, {h * 0.5:.2f}, {z}]")
+                lines.append(f' * **box**: {{ size: [{w}, {h}, {w}], color: "{col}", glow: "#080c14" }}')
     return "\n".join(lines) + "\n"
 
+
+
 def extract_placed_blueprint_md(md_text: str, prefab_name: str, count: int = 1) -> tuple[str, int, str]:
-    """Extracts the last `count` placed object blocks from `md_text` and wraps them as a reusable #MV3D prefab."""
     clean_prefab = re.sub(r"[^a-zA-Z0-9_-]", "", str(prefab_name or ""))[:32] or "prefab"
     n_take = max(1, min(16, int(count)))
     matches = list(re.finditer(r"<!--\s*PLACED:([a-fA-F0-9]+)\b[^>]*-->", md_text, re.I))
     if not matches:
         return "", 0, "No placed objects found in this world to save into a blueprint."
-
     selected = matches[-n_take:]
     blocks = []
     for idx, m in enumerate(selected):
@@ -1441,20 +1568,18 @@ def extract_placed_blueprint_md(md_text: str, prefab_name: str, count: int = 1) 
         if not lines:
             continue
         if re.match(r"^#\s+", lines[0].strip()):
-            lines[0] = f"  ## Part_{idx}: " + re.sub(r"^#\s+", "", lines[0].strip())
+            lines[0] = f" ## Part_{idx}: " + re.sub(r"^#\s+", "", lines[0].strip())
         norm_lines = []
         for ln in lines:
-            if ln.startswith("  ## "):
-                norm_lines.append("  " + ln)
+            if ln.startswith(" ## "):
+                norm_lines.append(" " + ln)
             elif ln.startswith("* "):
-                norm_lines.append("  " + ln)
+                norm_lines.append(" " + ln)
             else:
-                norm_lines.append("    " + ln.lstrip())
+                norm_lines.append(" " + ln.lstrip())
         blocks.append("\n".join(norm_lines))
-
     if not blocks:
         return "", 0, "Could not extract valid geometry from placed objects."
-
     prefab_doc = (
         "---\n"
         f'title: "Blueprint: {clean_prefab}"\n'
@@ -1479,7 +1604,6 @@ def build_stamped_prefab_snippet(
     creator_nick: str,
     tag_id: str | None = None,
 ) -> tuple[str, str]:
-    """Creates a stamped #MV3D world node from a saved prefab blueprint with unique PLACED tag ID."""
     clean_prefab = re.sub(r"[^a-zA-Z0-9_-]", "", str(prefab_name or ""))[:32] or "prefab"
     tid = (tag_id or secrets.token_hex(3)).lower()
     safe_nick = re.sub(r"[^a-zA-Z0-9_-]", "", creator_nick)[:24] or "builder"
@@ -1488,10 +1612,8 @@ def build_stamped_prefab_snippet(
     y = _finite_float(y, 0.0, -100.0, 500.0)
     z = _finite_float(z, 0.0, -500.0, 500.0)
     yaw = round(_finite_float(yaw_deg, 0.0) % 360.0, 1)
-
     def_match = re.search(r"^#\s+@def\s+([A-Za-z0-9_-]+)\s*$", prefab_md, re.M)
     def_key = def_match.group(1) if def_match else clean_prefab
-
     snippet = (
         f"<!-- PLACED:{tid} by {safe_nick} prefab:{clean_prefab} -->\n"
         f"# Node: PLACED_{tid}\n"
@@ -1501,6 +1623,7 @@ def build_stamped_prefab_snippet(
         f"* **@use**: {def_key}"
     )
     return snippet, tid
+
 
 def build_placed_media_snippet(
     url: str,
@@ -1528,7 +1651,6 @@ def build_placed_media_snippet(
     pz = _finite_float(z, 0.0, -500.0, 500.0)
     yaw = round(_finite_float(yaw_deg, 0.0) % 360.0, 1)
     glow_hex = "#ff2442" if m_type == "youtube" else "#00b8ff"
-
     return (
         f"<!-- PLACED:{tid} by {safe_nick} media:{m_type} -->\n"
         f"# Node: PLACED_{tid}\n"
@@ -1552,7 +1674,6 @@ def build_ghost_preview_objects(
     yaw_deg: float = 0.0,
     alpha: float = 0.42,
 ) -> list[dict]:
-    """Builds lightweight preview primitive dicts matching `build_placed_mv3d_snippet` geometry."""
     sh = str(shape or "box").strip().lower()
     if sh not in PLACED_SHAPES:
         sh = "box"
@@ -1575,107 +1696,21 @@ def build_ghost_preview_objects(
         lx, lz = -1.6 * s * cos_y, 1.6 * s * sin_y
         rx, rz = 1.6 * s * cos_y, -1.6 * s * sin_y
         return [
-            {
-                "kind": "cylinder",
-                "pos": (px + lx, py + 1.8 * s, pz + lz),
-                "rot": (0.0, 1.0, 0.0, yaw),
-                "scale": (1.0, 1.0, 1.0),
-                "radius": 0.25 * s,
-                "height": 3.6 * s,
-                "diff": diff,
-                "emis": emis,
-                "alpha": a_val,
-            },
-            {
-                "kind": "cylinder",
-                "pos": (px + rx, py + 1.8 * s, pz + rz),
-                "rot": (0.0, 1.0, 0.0, yaw),
-                "scale": (1.0, 1.0, 1.0),
-                "radius": 0.25 * s,
-                "height": 3.6 * s,
-                "diff": diff,
-                "emis": emis,
-                "alpha": a_val,
-            },
-            {
-                "kind": "box",
-                "pos": (px, py + 3.75 * s, pz),
-                "rot": (0.0, 1.0, 0.0, yaw),
-                "scale": (1.0, 1.0, 1.0),
-                "size": (3.8 * s, 0.35 * s, 0.8 * s),
-                "diff": diff,
-                "emis": (diff[0] * 0.75, diff[1] * 0.75, diff[2] * 0.75),
-                "alpha": a_val,
-            },
+            {"kind": "cylinder", "pos": (px + lx, py + 1.8 * s, pz + lz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "radius": 0.25 * s, "height": 3.6 * s, "diff": diff, "emis": emis, "alpha": a_val},
+            {"kind": "cylinder", "pos": (px + rx, py + 1.8 * s, pz + rz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "radius": 0.25 * s, "height": 3.6 * s, "diff": diff, "emis": emis, "alpha": a_val},
+            {"kind": "box", "pos": (px, py + 3.75 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "size": (3.8 * s, 0.35 * s, 0.8 * s), "diff": diff, "emis": (diff[0] * 0.75, diff[1] * 0.75, diff[2] * 0.75), "alpha": a_val},
         ]
-
     if sh == "pillar":
-        return [{
-            "kind": "cylinder",
-            "pos": (px, py + 2.0 * s, pz),
-            "rot": (0.0, 1.0, 0.0, yaw),
-            "scale": (1.0, 1.0, 1.0),
-            "radius": 0.45 * s,
-            "height": 4.0 * s,
-            "diff": diff,
-            "emis": emis,
-            "alpha": a_val,
-        }]
+        return [{"kind": "cylinder", "pos": (px, py + 2.0 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "radius": 0.45 * s, "height": 4.0 * s, "diff": diff, "emis": emis, "alpha": a_val}]
     if sh == "sphere":
-        return [{
-            "kind": "sphere",
-            "pos": (px, py + 1.0 * s, pz),
-            "rot": (0.0, 1.0, 0.0, yaw),
-            "scale": (1.0, 1.0, 1.0),
-            "radius": 1.0 * s,
-            "diff": diff,
-            "emis": emis,
-            "alpha": a_val,
-        }]
+        return [{"kind": "sphere", "pos": (px, py + 1.0 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "radius": 1.0 * s, "diff": diff, "emis": emis, "alpha": a_val}]
     if sh == "cone":
-        return [{
-            "kind": "cone",
-            "pos": (px, py + 1.25 * s, pz),
-            "rot": (0.0, 1.0, 0.0, yaw),
-            "scale": (1.0, 1.0, 1.0),
-            "radius": 1.1 * s,
-            "height": 2.5 * s,
-            "diff": diff,
-            "emis": emis,
-            "alpha": a_val,
-        }]
+        return [{"kind": "cone", "pos": (px, py + 1.25 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "radius": 1.1 * s, "height": 2.5 * s, "diff": diff, "emis": emis, "alpha": a_val}]
     if sh == "platform":
-        return [{
-            "kind": "box",
-            "pos": (px, py + 0.15 * s, pz),
-            "rot": (0.0, 1.0, 0.0, yaw),
-            "scale": (1.0, 1.0, 1.0),
-            "size": (4.0 * s, 0.3 * s, 4.0 * s),
-            "diff": diff,
-            "emis": emis,
-            "alpha": a_val,
-        }]
+        return [{"kind": "box", "pos": (px, py + 0.15 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "size": (4.0 * s, 0.3 * s, 4.0 * s), "diff": diff, "emis": emis, "alpha": a_val}]
     if sh == "wall":
-        return [{
-            "kind": "box",
-            "pos": (px, py + 1.5 * s, pz),
-            "rot": (0.0, 1.0, 0.0, yaw),
-            "scale": (1.0, 1.0, 1.0),
-            "size": (4.5 * s, 3.0 * s, 0.4 * s),
-            "diff": diff,
-            "emis": emis,
-            "alpha": a_val,
-        }]
-    return [{
-        "kind": "box",
-        "pos": (px, py + 1.0 * s, pz),
-        "rot": (0.0, 1.0, 0.0, yaw),
-        "scale": (1.0, 1.0, 1.0),
-        "size": (2.0 * s, 2.0 * s, 2.0 * s),
-        "diff": diff,
-        "emis": emis,
-        "alpha": a_val,
-    }]
+        return [{"kind": "box", "pos": (px, py + 1.5 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "size": (4.5 * s, 3.0 * s, 0.4 * s), "diff": diff, "emis": emis, "alpha": a_val}]
+    return [{"kind": "box", "pos": (px, py + 1.0 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "size": (2.0 * s, 2.0 * s, 2.0 * s), "diff": diff, "emis": emis, "alpha": a_val}]
 
 
 RESERVED_ROLE_LABELS = frozenset({
