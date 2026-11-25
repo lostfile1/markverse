@@ -9,17 +9,19 @@ A self-hosted, decentralized 3D metaverse platform inspired by 1990s Active Worl
 
 ---
 
-## Architecture
+## Repository Layout & Architecture
 
 Makerverse keeps its core stack compact and portable across Unix-like systems (OpenBSD, FreeBSD, Linux) and desktops:
 
-| File | Role | Key Responsibilities |
+| File / Folder | Role | Key Responsibilities |
 | :--- | :--- | :--- |
 | **`mv3d.py`** | Scene & Format Engine | Parses `#MV3D` YAML frontmatter + Markdown node trees, resolves `@def`/`@use` blueprints, computes quaternion transforms, validates uploads, mutates placed snippets, and enforces media SSRF rules. |
-| **`server.py`** | Headless Multiplayer Node | Runs the `asyncio` WebSocket server (`ws://0.0.0.0:8765`), Ed25519 challenge-response auth, per-world ACLs, persistent trigger states, snapshot backups, federation probing, and the built-in HTTP node directory & status page (`http://0.0.0.0:8766/`). |
-| **`client.py`** | 3D OpenGL Client | Renders `#MV3D` worlds and custom avatars via OpenGL 3.3 Core shaders, spatial-hash AABB physics, 3D ghost placement (`[B]`), `[I]` inspect/nudge/rotate/scale/delete tools, push-to-talk spatial voice chat, and live `/watch` hot-reloading. |
-| **`build.py`** | Standalone Binary Builder | Compiles `server.py` and `client.py` (bundling `mv3d.py`) into standalone single-file executables (`./dist/makerverse-server` and `./dist/makerverse-client`) via PyInstaller. |
+| **`server.py`** | Headless Multiplayer Node | Runs the `asyncio` WebSocket server (`ws://0.0.0.0:8765`), Ed25519 challenge-response auth, per-world ACLs, persistent trigger states, snapshot backups, federation probing, and a cached HTTP node directory & status page (`http://0.0.0.0:8766/`). |
+| **`client.py`** | 3D OpenGL Client | Renders `#MV3D` worlds and custom avatars via OpenGL 3.3 Core shaders, spatial-hash AABB physics, 3D ghost placement (`[B]`), `[I]` inspect/nudge/rotate/scale/delete tools, `Tab` command autocomplete, zero-asset synthesized terminal & warp SFX, `F12` screenshots, push-to-talk spatial voice chat, and live `/watch` hot-reloading. |
+| **`build.py`** | Standalone Binary Builder | Compiles `server.py` and `client.py` (bundling `mv3d.py`, `PyNaCl`, and `_cffi_backend`) into standalone single-file executables (`./dist/makerverse-server` and `./dist/makerverse-client`) via PyInstaller. |
 | **`test_makerverse.py`** | Smoke & Regression Suite | Exercises `#MV3D` parsing, snippet mutations, `@def` pruning, SSRF guards, persistent trigger reconciliation, and the HTTP status/directory endpoints. |
+| **`examples/`** | Sample `#MV3D` Assets | Ready-to-load sample world (`demo_gallery.md`) and multi-expression avatar (`cyber_avatar.md`) for testing `/upload` or `/watch`. |
+| **`requirements.txt`** | Python Dependencies | Lists core server & 3D client packages (`websockets`, `PyNaCl`, `pygame-ce`, `PyOpenGL`, `numpy`). |
 
 ---
 
@@ -27,15 +29,16 @@ Makerverse keeps its core stack compact and portable across Unix-like systems (O
 
 ### 1. Install Dependencies
 
-**Headless Server (`server.py` + `mv3d.py`):**
-```bash
-pip install websockets PyNaCl
-```
+Install from `requirements.txt` or pick the minimal package set for your target:
 
-**3D Desktop Client (`client.py` + `mv3d.py`):**
 ```bash
-pip install pygame PyOpenGL numpy websockets PyNaCl
-# Optional: push-to-talk spatial voice chat
+# Install both server and 3D client dependencies
+pip install -r requirements.txt
+
+# Or install minimal headless server dependencies only:
+pip install websockets PyNaCl
+
+# Optional: push-to-talk spatial voice chat in client.py
 pip install sounddevice
 ```
 
@@ -61,13 +64,13 @@ Use `--portable` to store identity keys, bookmarks, waypoints, and world caches 
 
 ## Building Standalone Binaries (`build.py`)
 
-Bundle `server.py` and `client.py` (along with `mv3d.py`) into self-contained single-file executables using PyInstaller:
+Bundle `server.py` and `client.py` (along with `mv3d.py`, `PyNaCl`, and `cffi`/`_cffi_backend`) into self-contained single-file executables using PyInstaller:
 
 ```bash
 pip install pyinstaller
 
-# Build both ./dist/makerverse-server and ./dist/makerverse-client
-python3 build.py
+# Clean previous build artifacts and build both ./dist/makerverse-server and ./dist/makerverse-client
+python3 build.py --clean
 
 # Or build a single target
 python3 build.py --server-only
@@ -80,7 +83,7 @@ When run as a compiled binary, `makerverse-server` defaults to storing `./makerv
 
 ## `#MV3D` Markdown Format
 
-Worlds and avatars are plain `.md` files with optional YAML frontmatter and hierarchical `# Node` / `## Part` headings:
+Worlds and avatars are plain `.md` files with optional YAML frontmatter and hierarchical `# Node` / `## Part` headings (see `examples/demo_gallery.md` and `examples/cyber_avatar.md`):
 
 ```markdown
 ---
@@ -130,7 +133,7 @@ spawn: { pos: [0, 2.0, 12.0], yaw: 0 }
 | Key | Action |
 | :--- | :--- |
 | `W A S D` / Arrows | Move (`Space` jump / fly up, `Shift` fly down) |
-| `T` / `/` / `Enter` | Open chat / command input (`Up`/`Down` history, `Ctrl+V`/`C`/`X` clipboard) |
+| `T` / `/` / `Enter` | Open chat / command input (`Tab` autocomplete, `Up`/`Down` history, `Ctrl+V`/`C`/`X` clipboard) |
 | `B` | Toggle 3D Ghost Placement Preview & cycle shapes (`LMB` place, `Scroll` distance, `[` `]` scale, `R` rotate) |
 | `I` | Toggle Inspect Mode (`PgUp`/`PgDn` nudge Y, `R` rotate 45 deg, `-`/`=` scale, `Del` remove) |
 | `F` | Interact with nearby `[F]` trigger switch or embedded media screen |
@@ -138,14 +141,15 @@ spawn: { pos: [0, 2.0, 12.0], yaw: 0 }
 | `V` | Cycle camera (`first-person` -> `third-person` -> `front-view`) |
 | `1`–`4` | Avatar emotes (`wave`, `dance`, `spin`, `jump`) |
 | `Left/Right Alt` | Hold for Push-to-Talk spatial voice chat (enable with `/voice`) |
+| `F12` | Save PNG screenshot of the 3D viewport to `exports/` |
 | `H` / `Esc` | Toggle HUD visibility / release mouse grab |
 
 ### Slash Commands
 * **Navigation & Federation:** `/worlds [query]`, `/world <name>`, `/spawn`, `/hop <bookmark|ws://host:port> [world]`, `/back`, `/servers`, `/bookmark <name> <url>`, `/nodes`, `/linknode <ws://host:port> [label]`, `/unlinknode <url|label>`
 * **World Building:** `/createworld <name> [template] [desc]`, `/templates`, `/ghost [shape|off] [color] [scale]`, `/place <shape> [color] [scale]`, `/placeportal <world|server/world> [color] [radius]`, `/moveobj`, `/rotateobj`, `/scaleobj`, `/paint`, `/cloneobj`, `/delobj`, `/undo`, `/cleanworld`
 * **Blueprints & Live Reload:** `/saveprefab <name> [count]`, `/stamp <name> [scale]`, `/delprefab <name>`, `/prefabs`, `/watch <world|avatar> <name> <file.md>`, `/unwatch`
-* **World Metadata & Backups:** `/worldinfo [world]`, `/title`, `/desc`, `/tags`, `/sky <hex>`, `/fog <hex>`, `/radio <url|off>`, `/setspawn`, `/clearspawn`, `/backup [label]`, `/backups`, `/restore <file.md>`, `/export`, `/rate <1-5> [comment]`, `/topworlds`
-* **Identity, Social & ACLs:** `/nick <name>`, `/avatar <name>`, `/avatars`, `/mood <expr>`, `/friends`, `/addfriend <u>`, `/accept <u>`, `/msg <u> <text>`, `/goto <u>`, `/perms`, `/setrole <u> <admin|builder|guest>`, `/acl`, `/privateworld <on|off>`, `/allowbuilder <u>`, `/allowvisitor <u>`
+* **World Metadata, Captures & Backups:** `/worldinfo [world]`, `/title`, `/desc`, `/tags`, `/sky <hex>`, `/fog <hex>`, `/radio <url|off>`, `/setspawn`, `/clearspawn`, `/backup [label]`, `/backups`, `/restore <file.md>`, `/export`, `/screenshot`, `/chatlog [n]`, `/rate <1-5> [comment]`, `/topworlds`
+* **Audio, Identity, Social & ACLs:** `/sfx` (toggle synthesized typing & warp audio cues), `/voice`, `/mute`, `/nick <name>`, `/avatar <name>`, `/avatars`, `/mood <expr>`, `/friends`, `/addfriend <u>`, `/accept <u>`, `/msg <u> <text>`, `/goto <u>`, `/perms`, `/setrole <u> <admin|builder|guest>`, `/acl`, `/privateworld <on|off>`, `/allowbuilder <u>`, `/allowvisitor <u>`
 
 ---
 
