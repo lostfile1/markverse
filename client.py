@@ -1214,6 +1214,8 @@ class ProceduralSoundFX:
                 "chat_open": self._synth_chirp(sr, channels, f0=620.0, f1=1180.0, dur_ms=38, gain=0.16),
                 "chat_send": self._synth_chirp(sr, channels, f0=880.0, f1=1480.0, dur_ms=48, gain=0.18),
                 "ui_ping": self._synth_chirp(sr, channels, f0=1040.0, f1=1320.0, dur_ms=42, gain=0.14),
+                "trigger_chime": self._synth_chirp(sr, channels, f0=780.0, f1=1560.0, dur_ms=65, gain=0.18),
+                "portal_warp": self._synth_chirp(sr, channels, f0=320.0, f1=1680.0, dur_ms=160, gain=0.22),
             }
             self.ready = True
         except Exception:
@@ -1410,6 +1412,7 @@ class MakerverseClient:
         self.loop = None
         self.connected = False
         self.teleport_req = None
+        self.screenshot_req = False
         self.teleport_yaw = None
         self.running = True
 
@@ -1613,6 +1616,7 @@ class MakerverseClient:
         n_matched = self._set_trigger_visual_state(trig, is_active)
         if broadcast and self.connected:
             self.send_json({"type": "trigger_sync", "trigger_id": tid, "active": is_active})
+        self.sfx.play("trigger_chime")
         state_lbl = "ON" if is_active else "OFF"
         self.log("TRIGGER", "#ffaa00", f"Activated '{tid}' [{state_lbl}] ({trig.get('action', 'toggle_glow')}) on {n_matched} object(s).")
 
@@ -1700,9 +1704,11 @@ class MakerverseClient:
                         self.log("ERR", "#ff4444", f"Portal has invalid target server '{p_srv}'.")
                         break
                     if norm_srv != self.server_url:
+                        self.sfx.play("portal_warp")
                         self.log("PORTAL", "#00ff66", f"Stepping through cross-server portal -> {norm_srv}/{dest}...")
                         self.hop_to_server(norm_srv, dest, spawn_pos=p_spawn, spawn_yaw=p_yaw)
                         break
+                self.sfx.play("portal_warp")
                 self.log("PORTAL", "#00ff66", f"Stepping through portal -> '{dest}'...")
                 cached = get_cached_world(dest)
                 pkt = {"type": "join_world", "world": dest}
@@ -2348,13 +2354,115 @@ def _split_cmd_tokens(raw_text: str) -> list[str]:
         return s.split()
 
 
+_SLASH_COMMANDS = sorted([
+    "/help", "/rate", "/topworlds", "/worldinfo", "/title", "/desc", "/tags",
+    "/sky", "/fog", "/radio", "/mute", "/voice", "/sfx", "/typing",
+    "/hop", "/back", "/servers", "/bookmark", "/unbookmark", "/worlds",
+    "/block", "/unblock", "/blocked", "/waypoint", "/delwaypoint", "/waypoints",
+    "/clearwaypoints", "/tpwp", "/waygoto", "/peers", "/who",
+    "/setspawn", "/clearspawn", "/spawn", "/world", "/templates", "/createworld",
+    "/prefabs", "/saveprefab", "/delprefab", "/stamp", "/snap",
+    "/watch", "/unwatch", "/ghost", "/preview", "/place", "/placeportal", "/portal",
+    "/moveobj", "/scaleobj", "/rotateobj", "/paint", "/cloneobj", "/delobj",
+    "/undo", "/cleanworld", "/prunedefs", "/nodes", "/federation",
+    "/linknode", "/unlinknode", "/backup", "/backups", "/restore", "/export",
+    "/chatlog", "/screenshot", "/emote", "/mood", "/friends", "/addfriend",
+    "/accept", "/goto", "/msg", "/key", "/perms", "/setrole",
+    "/admin", "/unadmin", "/builder", "/unbuilder", "/grant", "/ungrant",
+    "/ban", "/unban", "/defaultrole", "/maxworlds", "/userworldlimit",
+    "/acl", "/privateworld", "/allowbuilder", "/removebuilder",
+    "/allowvisitor", "/revokevisitor", "/delworld", "/nick",
+    "/avatars", "/avatar", "/fly", "/cam", "/upload", "/quit",
+])
+
+
+def _autocomplete_chat_buffer(client: MakerverseClient, buf: str, state: dict) -> str:
+    """Tab-cycle autocomplete for /commands, world names, templates, prefabs, avatars, and shapes."""
+    if not buf.startswith("/"):
+        return buf
+    if state.get("base") == buf and state.get("matches"):
+        matches = state["matches"]
+        idx = (state.get("idx", 0) + 1) % len(matches)
+        state["idx"] = idx
+        out = matches[idx]
+        state["base"] = out
+        return out
+
+    raw = buf
+    has_trailing_space = raw.endswith(" ")
+    tokens = raw.strip().split()
+    matches: list[str] = []
+
+    if len(tokens) == 1 and not has_trailing_space:
+        prefix = tokens[0].lower()
+        matches = [c + " " for c in _SLASH_COMMANDS if c.startswith(prefix)]
+    elif len(tokens) >= 1:
+        cmd = tokens[0].lower()
+        partial = "" if has_trailing_space else tokens[-1].lower()
+        arg_index = len(tokens) if has_trailing_space else (len(tokens) - 1)
+        head = " ".join(tokens[:arg_index]) + " "
+
+        candidates: list[str] = []
+        if cmd in ("/world", "/worldinfo", "/delworld", "/placeportal", "/portal") and arg_index == 1:
+            candidates = sorted(set(client.worlds or ["hub"]))
+        elif cmd == "/createworld" and arg_index == 2:
+            candidates = sorted(WORLD_TEMPLATES.keys())
+        elif cmd in ("/ghost", "/preview", "/place") and arg_index == 1:
+            candidates = list(PLACED_SHAPES)
+        elif cmd in ("/stamp", "/delprefab") and arg_index == 1:
+            candidates = sorted(set(client.prefabs or []))
+        elif cmd == "/avatar" and arg_index == 1:
+            candidates = ["default"] + sorted(set(client.avatars or []))
+        elif cmd == "/emote" and arg_index == 1:
+            candidates = ["wave", "dance", "spin", "jump"]
+        elif cmd == "/mood" and arg_index == 1:
+            candidates = ["neutral", "happy", "smirk", "angry", "surprised", "reset"]
+        elif cmd in ("/tpwp", "/waygoto", "/delwaypoint") and arg_index == 1:
+            candidates = sorted(client.waypoints.keys())
+        elif cmd == "/hop" and arg_index == 1:
+            candidates = sorted(load_server_directory().get("bookmarks", {}).keys())
+
+        matches = [head + c for c in candidates if c.lower().startswith(partial)]
+
+    if not matches:
+        state.clear()
+        return buf
+    state["matches"] = matches
+    state["idx"] = 0
+    state["base"] = matches[0]
+    return matches[0]
+
+
+def save_gl_screenshot(client: MakerverseClient) -> Path | None:
+    if pygame is None:
+        return None
+    try:
+        glFinish()
+        glReadBuffer(GL_FRONT)
+        raw_pixels = glReadPixels(0, 0, WINDOW_W, WINDOW_H, GL_RGBA, GL_UNSIGNED_BYTE)
+        surf = pygame.image.frombytes(raw_pixels, (WINDOW_W, WINDOW_H), "RGBA", True)
+        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        ts_lbl = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        safe_w = _clean_ident(client.world, 32, "world")
+        out_fp = (EXPORTS_DIR.resolve() / f"screenshot_{safe_w}_{ts_lbl}.png").resolve()
+        if out_fp.parent != EXPORTS_DIR.resolve():
+            return None
+        pygame.image.save(surf, str(out_fp))
+        client.sfx.play("ui_ping")
+        client.log("SCREENSHOT", "#00ff66", f"Saved screenshot -> {out_fp}")
+        return out_fp
+    except Exception as exc:
+        client.log("ERR", "#ff4444", f"Screenshot failed: {exc}")
+        return None
+
+
 def handle_command(client: MakerverseClient, text: str):
     parts = text.strip().split(" ", 3)
     cmd = parts[0].lower()
     if cmd == "/help":
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /rotateobj | /paint | /cloneobj | /delobj | /undo | /snap [m]")
-        client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /delprefab <n> | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /restore <file.md> | /export | /chatlog [n]")
+        client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /delprefab <n> | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /restore <file.md> | /export | /chatlog [n] | /screenshot")
         client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /cleanworld | /peers | /voice | /sfx | /mood <expr> | /nodes | /linknode <url> [lbl] | /hop <node> | /back | /nick <n>")
     elif cmd == "/rate":
         if len(parts) < 2 or not parts[1].strip():
@@ -3008,6 +3116,8 @@ def handle_command(client: MakerverseClient, text: str):
         client.send_json({"type": "world_backup", "action": "restore", "world": client.world, "file": parts[1].strip()})
     elif cmd == "/export":
         client.send_json({"type": "world_backup", "action": "export", "world": client.world})
+    elif cmd in ("/screenshot", "/snapimg"):
+        client.screenshot_req = True
     elif cmd == "/chatlog":
         raw_n = parts[1].strip() if len(parts) > 1 and parts[1].strip() else ""
         if raw_n and re.fullmatch(r"[-+]?\d+", raw_n):
@@ -3450,6 +3560,7 @@ def main():
 
     chat_mode = False
     chat_buffer = ""
+    tab_state: dict = {}
     last_move_send = 0.0
     clock = pygame.time.Clock()
     ortho_mat = mat4_ortho(0, WINDOW_W, WINDOW_H, 0)
@@ -3487,8 +3598,14 @@ def main():
                     if chat_mode:
                         mods = pygame.key.get_mods()
                         has_shortcut_mod = bool(mods & (KMOD_CTRL | KMOD_META))
-                        if event.key == K_ESCAPE:
+                        if event.key == K_TAB:
+                            new_buf = _autocomplete_chat_buffer(client, chat_buffer, tab_state)
+                            if new_buf != chat_buffer:
+                                chat_buffer = new_buf
+                                client.sfx.play("key_tick")
+                        elif event.key == K_ESCAPE:
                             chat_mode, chat_buffer = False, ""
+                            tab_state.clear()
                             client.history_idx = None
                             client.history_draft = ""
                             if mouse_grabbed:
@@ -3628,6 +3745,8 @@ def main():
                             client.camera_mode = order[(order.index(client.camera_mode) + 1) % 3]
                         elif event.key == K_h:
                             client.hud_hidden = not client.hud_hidden
+                        elif event.key == K_F12:
+                            client.screenshot_req = True
                         elif event.key == K_f:
                             client.trigger_interact(now)
                         elif event.key == K_g:
@@ -4015,6 +4134,9 @@ def main():
                 glEnable(GL_DEPTH_TEST)
 
             pygame.display.flip()
+            if client.screenshot_req:
+                client.screenshot_req = False
+                save_gl_screenshot(client)
     finally:
         client.running = False
         client.radio.stop()

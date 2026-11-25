@@ -403,7 +403,15 @@ def set_persistent_trigger_state(world_name: str, trig_id: str, active: bool, md
     return True, cur_map
 
 
-def build_public_directory_payload() -> dict:
+_DIRECTORY_CACHE: dict[str, object] = {"ts": 0.0, "payload": None}
+
+
+def build_public_directory_payload(force_refresh: bool = False) -> dict:
+    now_m = time.monotonic()
+    if not force_refresh and _DIRECTORY_CACHE["payload"] is not None and (now_m - float(_DIRECTORY_CACHE["ts"])) < 2.5:
+        cached_copy = dict(_DIRECTORY_CACHE["payload"])
+        cached_copy["online_count"] = len(CLIENTS)
+        return cached_copy
     cfg = load_server_config()
     fed = load_federation()
     meta = load_world_meta()
@@ -436,7 +444,7 @@ def build_public_directory_payload() -> dict:
         {"url": u, "label": str(m.get("label") or u)[:48], "default_world": str(m.get("default_world") or "hub")[:32]}
         for u, m in fed.get("peers", {}).items()
     ]
-    return {
+    res_payload = {
         "status": "online",
         "protocol": "makerverse-mv3d-v2",
         "node_name": fed.get("node_name", cfg["node_name"]),
@@ -448,6 +456,9 @@ def build_public_directory_payload() -> dict:
         "federation_peers": peers_out,
         "generated_at": int(time.time()),
     }
+    _DIRECTORY_CACHE["ts"] = now_m
+    _DIRECTORY_CACHE["payload"] = res_payload
+    return res_payload
 
 
 def render_status_html(payload: dict) -> str:
