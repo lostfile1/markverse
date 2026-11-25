@@ -16,20 +16,45 @@ MAX_COORD_VAL = 5000.0
 
 COLOR_NAMES = {
     "cyan": (0.0, 1.0, 0.85),
+    "aqua": (0.0, 0.92, 0.95),
+    "teal": (0.0, 0.72, 0.70),
+    "mint": (0.20, 0.96, 0.72),
+    "ice": (0.65, 0.90, 1.0),
     "magenta": (1.0, 0.15, 0.75),
     "pink": (1.0, 0.35, 0.80),
+    "hotpink": (1.0, 0.12, 0.62),
+    "neonpink": (1.0, 0.16, 0.78),
+    "rose": (1.0, 0.28, 0.52),
+    "crimson": (0.86, 0.08, 0.24),
+    "coral": (1.0, 0.42, 0.32),
+    "salmon": (0.98, 0.50, 0.44),
     "blue": (0.20, 0.60, 1.0),
+    "neonblue": (0.12, 0.55, 1.0),
+    "navy": (0.08, 0.16, 0.42),
+    "indigo": (0.35, 0.22, 0.85),
     "purple": (0.70, 0.25, 1.0),
+    "neonpurple": (0.76, 0.18, 1.0),
     "violet": (0.60, 0.20, 0.95),
     "green": (0.15, 0.95, 0.40),
+    "neongreen": (0.18, 1.0, 0.35),
+    "lime": (0.55, 1.0, 0.12),
     "emerald": (0.10, 0.85, 0.45),
+    "olive": (0.48, 0.52, 0.16),
+    "yellow": (1.0, 0.92, 0.15),
     "amber": (1.0, 0.65, 0.0),
     "gold": (1.0, 0.78, 0.15),
     "orange": (1.0, 0.45, 0.10),
+    "neonorange": (1.0, 0.36, 0.05),
     "red": (1.0, 0.20, 0.25),
+    "maroon": (0.52, 0.08, 0.14),
     "white": (0.95, 0.97, 1.0),
     "silver": (0.72, 0.78, 0.86),
-    "dark": (0.12, 0.14, 0.22),
+    "gray": (0.48, 0.52, 0.58),
+    "grey": (0.48, 0.52, 0.58),
+    "black": (0.06, 0.07, 0.10),
+    "brown": (0.52, 0.30, 0.14),
+    "tan": (0.78, 0.62, 0.42),
+    "beige": (0.86, 0.78, 0.64),
 }
 
 WORLD_TEMPLATES = {
@@ -83,6 +108,9 @@ def parse_color(val, default=(0.45, 0.65, 0.85)) -> tuple[float, float, float]:
     s = str(val or "").strip().strip('"').strip("'").lower()
     if s in COLOR_NAMES:
         return COLOR_NAMES[s]
+    s_compact = re.sub(r"[\s_-]+", "", s)
+    if s_compact in COLOR_NAMES:
+        return COLOR_NAMES[s_compact]
     hx = s.lstrip("#")
     if re.fullmatch(r"[0-9a-f]{6}", hx):
         return (int(hx[0:2], 16) / 255.0, int(hx[2:4], 16) / 255.0, int(hx[4:6], 16) / 255.0)
@@ -675,8 +703,12 @@ def parse_mv3d(md_text: str) -> dict:
         elif prop == "@use":
             tmpl_name = str(val).strip()
             def_anc = next((n for n in reversed(stack) if n["is_def"]), None)
+            if def_anc is not None and tmpl_name == def_anc.get("def_name"):
+                continue
             for tmpl in defs_table.get(tmpl_name, []):
                 if len(scene["objects"]) >= MAX_SCENE_OBJECTS:
+                    break
+                if def_anc is not None and len(def_anc["records"]) >= MAX_SCENE_OBJECTS:
                     break
                 scaled_loc = (
                     tmpl["rel_pos"][0] * cur["scale"][0],

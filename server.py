@@ -626,7 +626,7 @@ def sanitize_name(name: str) -> str:
 
 
 def sanitize_plugin_arg(raw_arg: str) -> str:
-    return re.sub(r'[\r\n\x00\{\}\[\]"]', "", str(raw_arg or "")).strip()[:120]
+    return re.sub(r'[\r\n\x00\{\}\[\]"`#*]', "", str(raw_arg or "")).strip()[:120]
 
 
 def validate_hex_color(raw_color: str) -> str:

@@ -568,7 +568,7 @@ class ModernRenderer:
             w, h = surf.get_size()
             if w <= 0 or h <= 0:
                 return
-            raw = pygame.image.tostring(surf, "RGBA", True)
+            raw = pygame.image.tobytes(surf, "RGBA", True) if hasattr(pygame.image, "tobytes") else pygame.image.tostring(surf, "RGBA", True)
             tex = glGenTextures(1)
             glBindTexture(GL_TEXTURE_2D, tex)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
@@ -1190,6 +1190,78 @@ class VoiceChat:
                     pass
 
 
+class ProceduralSoundFX:
+    """Zero-asset synthesized retro terminal / mechanical key & UI sound effects via pygame.mixer."""
+    def __init__(self):
+        self.enabled = True
+        self.ready = False
+        self.sounds: dict[str, object] = {}
+
+    def init_audio(self):
+        if pygame is None:
+            return
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+            init_info = pygame.mixer.get_init()
+            if not init_info:
+                return
+            sr, _fmt, channels = init_info
+            self.sounds = {
+                "key_tick": self._synth_click(sr, channels, freq=1850.0, dur_ms=14, gain=0.14, pitch_drop=0.65),
+                "key_space": self._synth_click(sr, channels, freq=740.0, dur_ms=22, gain=0.18, pitch_drop=0.55),
+                "key_back": self._synth_click(sr, channels, freq=520.0, dur_ms=20, gain=0.17, pitch_drop=0.45),
+                "chat_open": self._synth_chirp(sr, channels, f0=620.0, f1=1180.0, dur_ms=38, gain=0.16),
+                "chat_send": self._synth_chirp(sr, channels, f0=880.0, f1=1480.0, dur_ms=48, gain=0.18),
+                "ui_ping": self._synth_chirp(sr, channels, f0=1040.0, f1=1320.0, dur_ms=42, gain=0.14),
+            }
+            self.ready = True
+        except Exception:
+            self.ready = False
+
+    def _finalize_pcm(self, mono: np.ndarray, channels: int):
+        clipped = np.clip(mono * 32767.0, -32768.0, 32767.0).astype(np.int16)
+        if channels == 2:
+            buf = np.column_stack((clipped, clipped))
+        else:
+            buf = clipped
+        return pygame.sndarray.make_sound(np.ascontiguousarray(buf))
+
+    def _synth_click(self, sr: int, channels: int, freq: float, dur_ms: int, gain: float, pitch_drop: float):
+        n = max(32, int(sr * (dur_ms / 1000.0)))
+        t = np.linspace(0.0, dur_ms / 1000.0, n, endpoint=False, dtype=np.float32)
+        env = np.exp(-t * (6.5 / max(0.004, dur_ms / 1000.0)))
+        inst_freq = freq * (1.0 - pitch_drop * (t / max(0.004, dur_ms / 1000.0)))
+        phase = 2.0 * np.pi * np.cumsum(inst_freq) / float(sr)
+        rng = np.random.default_rng(int(freq) & 0xFFFF)
+        noise = rng.uniform(-1.0, 1.0, n).astype(np.float32) * np.exp(-t * 420.0)
+        wave = (0.72 * np.sin(phase) + 0.28 * noise) * env * gain
+        return self._finalize_pcm(wave, channels)
+
+    def _synth_chirp(self, sr: int, channels: int, f0: float, f1: float, dur_ms: int, gain: float):
+        n = max(48, int(sr * (dur_ms / 1000.0)))
+        t = np.linspace(0.0, dur_ms / 1000.0, n, endpoint=False, dtype=np.float32)
+        env = np.exp(-t * (4.5 / max(0.006, dur_ms / 1000.0)))
+        inst_freq = np.linspace(f0, f1, n, dtype=np.float32)
+        phase = 2.0 * np.pi * np.cumsum(inst_freq) / float(sr)
+        wave = np.sin(phase) * env * gain
+        return self._finalize_pcm(wave, channels)
+
+    def play(self, name: str):
+        if not self.enabled or not self.ready:
+            return
+        snd = self.sounds.get(name)
+        if snd is not None:
+            try:
+                snd.play()
+            except Exception:
+                pass
+
+    def toggle(self) -> bool:
+        self.enabled = not self.enabled
+        return self.enabled
+
+
 class RadioPlayer:
     def __init__(self):
         self.url = ""
@@ -1303,6 +1375,7 @@ class MakerverseClient:
         self.peers = {}
         self.media_states: dict[str, dict] = {}
         self.radio = RadioPlayer()
+        self.sfx = ProceduralSoundFX()
         self.voice = VoiceChat(self.send_json, self.log)
         self.last_del_shortcut_at = 0.0
         self.last_nudge_at = 0.0
@@ -2282,7 +2355,7 @@ def handle_command(client: MakerverseClient, text: str):
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /rotateobj | /paint | /cloneobj | /delobj | /undo | /snap [m]")
         client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /delprefab <n> | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /restore <file.md> | /export | /chatlog [n]")
-        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /cleanworld | /peers | /voice | /mood <expr> | /nodes | /linknode <url> [lbl] | /hop <node> | /back | /nick <n>")
+        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /cleanworld | /peers | /voice | /sfx | /mood <expr> | /nodes | /linknode <url> [lbl] | /hop <node> | /back | /nick <n>")
     elif cmd == "/rate":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /rate <1..5> [comment] or /rate <world> <1..5> [comment]")
@@ -2388,6 +2461,11 @@ def handle_command(client: MakerverseClient, text: str):
         client.log("RADIO", "#ffaa00" if m else "#00ff66", "Radio muted." if m else "Radio unmuted.")
     elif cmd == "/voice":
         client.voice.toggle()
+    elif cmd in ("/sfx", "/typing"):
+        en = client.sfx.toggle()
+        if en:
+            client.sfx.play("ui_ping")
+        client.log("SFX", "#00ff66" if en else "#ffaa00", "Terminal typing & UI sound effects ON." if en else "Terminal typing & UI sound effects OFF.")
     elif cmd == "/hop":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", f"Usage: {cmd} <bookmark_name|ws://host:port> [world]")
@@ -3350,6 +3428,7 @@ def main():
     client.start_background()
 
     pygame.init()
+    client.sfx.init_audio()
     disp_info = pygame.display.Info()
     if disp_info.current_w > 0 and disp_info.current_h > 0:
         WINDOW_W = min(WINDOW_W, max(800, disp_info.current_w - 80))
@@ -3417,6 +3496,7 @@ def main():
                         elif event.key == K_RETURN:
                             trimmed_cmd = chat_buffer.strip()
                             if trimmed_cmd:
+                                client.sfx.play("chat_send")
                                 if not client.cmd_history or client.cmd_history[-1] != trimmed_cmd:
                                     client.cmd_history.append(trimmed_cmd)
                                     if len(client.cmd_history) > 50:
@@ -3435,6 +3515,7 @@ def main():
                                 elif client.history_idx > 0:
                                     client.history_idx -= 1
                                 chat_buffer = client.cmd_history[client.history_idx]
+                                client.sfx.play("key_tick")
                         elif event.key == K_DOWN:
                             if client.history_idx is not None:
                                 if client.history_idx + 1 < len(client.cmd_history):
@@ -3443,14 +3524,18 @@ def main():
                                 else:
                                     client.history_idx = None
                                     chat_buffer = client.history_draft
+                                client.sfx.play("key_tick")
                         elif event.key == K_BACKSPACE:
-                            chat_buffer = chat_buffer[:-1]
+                            if chat_buffer:
+                                chat_buffer = chat_buffer[:-1]
+                                client.sfx.play("key_back")
                         elif has_shortcut_mod and event.key == K_v:
                             pasted = _sanitize_paste_text(_get_clipboard_text(), max_len=300)
                             if pasted:
                                 remaining = max(0, 300 - len(chat_buffer))
                                 if remaining > 0:
                                     chat_buffer += pasted[:remaining]
+                                    client.sfx.play("key_tick")
                         elif has_shortcut_mod and event.key == K_c:
                             latest_msg = client.chat_log[-1][2] if (client.chat_log and len(client.chat_log[-1]) >= 3) else ""
                             to_copy = chat_buffer or latest_msg
@@ -3459,10 +3544,12 @@ def main():
                         elif has_shortcut_mod and event.key == K_x:
                             if chat_buffer and _set_clipboard_text(chat_buffer):
                                 chat_buffer = ""
+                                client.sfx.play("key_back")
                                 client.log("CLIPBOARD", "#00ffcc", "Cut text to clipboard.")
                         elif not has_shortcut_mod and event.unicode and event.unicode.isprintable():
                             if len(chat_buffer) < 300:
                                 chat_buffer += event.unicode
+                                client.sfx.play("key_space" if event.unicode == " " else "key_tick")
                     else:
                         if event.key in (K_LALT, K_RALT):
                             client.voice.set_ptt(True)
@@ -3564,6 +3651,7 @@ def main():
                             client.history_idx = None
                             client.history_draft = ""
                             chat_buffer = "/" if event.key == K_SLASH else ""
+                            client.sfx.play("chat_open")
                             pygame.event.set_grab(False); pygame.mouse.set_visible(True)
                 elif event.type == KEYUP:
                     if event.key in (K_LALT, K_RALT):
