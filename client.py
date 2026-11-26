@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import ctypes
 import hashlib
 import ipaddress
@@ -41,11 +40,6 @@ try:
     import websockets
 except Exception:
     websockets = None
-
-try:
-    import sounddevice as _sd
-except Exception:
-    _sd = None
 
 from mv3d import (
     _finite_int,
@@ -556,6 +550,7 @@ class ModernRenderer:
         clen = min(max(3.0, float(corner_len)), w * 0.35, h * 0.35)
         ct = min(max(1.5, b + 1.0), clen)
         if accent_rgba[3] > 0.0 and clen >= 3.0:
+            # Top-left & bottom-right neon corner brackets
             self.draw_rect_2d(x, y, clen, ct, accent_rgba)
             self.draw_rect_2d(x, y, ct, clen, accent_rgba)
             self.draw_rect_2d(x + w - clen, y + h - ct, clen, ct, accent_rgba)
@@ -920,6 +915,8 @@ def load_cached_avatar_md(av_name: str) -> str:
     return fp.read_text(encoding="utf-8", errors="replace")
 
 
+
+
 def normalize_ws_url(raw_url: str) -> str:
     url = (raw_url or "").strip()
     if not url or len(url) > 200 or any(ch in url for ch in ('"', "'", "\n", "\r", "\x00", " ")):
@@ -1036,6 +1033,14 @@ def store_cached_prefab_md(name: str, md_text: str):
     clean_n = _clean_ident(name, 32)
     if clean_n and md_text:
         _write_secure_file(PREFAB_CACHE_DIR / f"{clean_n}.md", md_text)
+
+
+import base64
+
+try:
+    import sounddevice as _sd
+except Exception:
+    _sd = None
 
 
 class VoiceChat:
@@ -1211,8 +1216,6 @@ class ProceduralSoundFX:
                 "ui_ping": self._synth_chirp(sr, channels, f0=1040.0, f1=1320.0, dur_ms=42, gain=0.14),
                 "trigger_chime": self._synth_chirp(sr, channels, f0=780.0, f1=1560.0, dur_ms=65, gain=0.18),
                 "portal_warp": self._synth_chirp(sr, channels, f0=320.0, f1=1680.0, dur_ms=160, gain=0.22),
-                "step_tick": self._synth_click(sr, channels, freq=260.0, dur_ms=18, gain=0.06, pitch_drop=0.50),
-                "prox_hum": self._synth_chirp(sr, channels, f0=420.0, f1=540.0, dur_ms=70, gain=0.07),
             }
             self.ready = True
         except Exception:
@@ -1387,12 +1390,7 @@ class MakerverseClient:
         self.ghost_scale = 1.0
         self.ghost_dist = 4.5
         self.ghost_yaw_offset = 0.0
-        self.ghost_portal_dest = ""
-        self.ghost_portal_server = ""
-        self.ghost_prefab_name = ""
-        self.last_step_sfx_at = 0.0
-        self.last_prox_sfx_at = 0.0
-        self.watch_spec = None
+        self.watch_spec = None  # {"kind": "world"|"avatar", "name": str, "path": Path, "mtime": float, "sha256": str, "last_poll": float}
         self.looked_at_hit = None
         self.camera_mode = "first"
         self.cam_dist = 4.5
@@ -1466,38 +1464,6 @@ class MakerverseClient:
             self.log("ERR", "#ff4444", "Builder or admin role required to place objects.")
             return
         px, py, pz, yaw_p = self._compute_ghost_placement()
-        if self.ghost_shape == "portal" and self.ghost_portal_dest:
-            rad_p = max(0.5, min(15.0, round(2.0 * self.ghost_scale, 2)))
-            self.portal_cooldown_until = time.time() + 3.0
-            pkt = {
-                "type": "world_edit",
-                "action": "place_portal",
-                "world": self.world,
-                "to": self.ghost_portal_dest,
-                "x": px,
-                "y": py,
-                "z": pz,
-                "radius": rad_p,
-                "color": self.ghost_color,
-                "yaw": yaw_p,
-            }
-            if self.ghost_portal_server:
-                pkt["server"] = self.ghost_portal_server
-            self.send_json(pkt)
-            return
-        if self.ghost_shape == "prefab" and self.ghost_prefab_name:
-            self.send_json({
-                "type": "prefab_action",
-                "action": "stamp",
-                "name": self.ghost_prefab_name,
-                "world": self.world,
-                "x": px,
-                "y": py,
-                "z": pz,
-                "scale": max(0.2, min(10.0, self.ghost_scale)),
-                "yaw": yaw_p,
-            })
-            return
         self.send_json({
             "type": "world_edit",
             "action": "place",
@@ -1717,20 +1683,6 @@ class MakerverseClient:
                     self.nearby_interact_target = {"_media_screen": ms}
                     kind_lbl = "YouTube" if ms.get("media_type") == "youtube" else "Web"
                     self.nearby_interact_prompt = f"[F] Open {ms.get('title') or ms.get('id', 'Screen')} ({kind_lbl})"
-
-        if now - self.last_prox_sfx_at >= 2.6:
-            near_interact = self.nearby_interact_target is not None
-            near_portal = False
-            for portal in self.scene.get("portals", []):
-                px, py, pz = portal["pos"]
-                rad = float(portal.get("radius", 2.0)) + 2.2
-                d_sq_p = (cam_pos[0] - px) ** 2 + ((cam_pos[1] - 1.8) - py) ** 2 + (cam_pos[2] - pz) ** 2
-                if d_sq_p <= rad * rad:
-                    near_portal = True
-                    break
-            if near_interact or near_portal:
-                self.last_prox_sfx_at = now
-                self.sfx.play("prox_hum")
 
         if now < self.portal_cooldown_until:
             return
@@ -2330,6 +2282,7 @@ class MakerverseClient:
                                 self.log("UPLOAD", "#00ff66", f"Uploaded {kind_up}: {name_up}")
                                 if kind_up == "world":
                                     if self.watch_spec and self.watch_spec.get("kind") == "world" and self.watch_spec.get("name") == name_up and self.world == name_up:
+                                        # Reload in-place without resetting camera position during live watch
                                         fp_w = self.watch_spec["path"]
                                         if fp_w.is_file():
                                             self._apply_world(name_up, fp_w.read_text(encoding="utf-8", errors="replace"), in_place=True)
@@ -2412,9 +2365,9 @@ _SLASH_COMMANDS = sorted([
     "/watch", "/unwatch", "/ghost", "/preview", "/place", "/placeportal", "/portal",
     "/moveobj", "/scaleobj", "/rotateobj", "/paint", "/cloneobj", "/delobj",
     "/undo", "/cleanworld", "/prunedefs", "/nodes", "/federation",
-    "/linknode", "/unlinknode", "/backup", "/backups", "/diff", "/restore", "/export",
-    "/chatlog", "/clear", "/screenshot", "/emote", "/mood", "/friends", "/addfriend",
-    "/accept", "/goto", "/msg", "/whisper", "/key", "/perms", "/setrole",
+    "/linknode", "/unlinknode", "/backup", "/backups", "/restore", "/export",
+    "/chatlog", "/screenshot", "/emote", "/mood", "/friends", "/addfriend",
+    "/accept", "/goto", "/msg", "/key", "/perms", "/setrole",
     "/admin", "/unadmin", "/builder", "/unbuilder", "/grant", "/ungrant",
     "/ban", "/unban", "/defaultrole", "/maxworlds", "/userworldlimit",
     "/acl", "/privateworld", "/allowbuilder", "/removebuilder",
@@ -2454,15 +2407,7 @@ def _autocomplete_chat_buffer(client: MakerverseClient, buf: str, state: dict) -
             candidates = sorted(set(client.worlds or ["hub"]))
         elif cmd == "/createworld" and arg_index == 2:
             candidates = sorted(WORLD_TEMPLATES.keys())
-        elif cmd in ("/ghost", "/preview") and arg_index == 1:
-            candidates = list(PLACED_SHAPES) + ["portal", "prefab", "off"]
-        elif cmd in ("/ghost", "/preview") and arg_index == 2 and len(tokens) >= 2:
-            sub_g = tokens[1].lower()
-            if sub_g == "portal":
-                candidates = sorted(set(client.worlds or ["hub"]))
-            elif sub_g == "prefab":
-                candidates = sorted(set(client.prefabs or []))
-        elif cmd == "/place" and arg_index == 1:
+        elif cmd in ("/ghost", "/preview", "/place") and arg_index == 1:
             candidates = list(PLACED_SHAPES)
         elif cmd in ("/stamp", "/delprefab") and arg_index == 1:
             candidates = sorted(set(client.prefabs or []))
@@ -2476,8 +2421,6 @@ def _autocomplete_chat_buffer(client: MakerverseClient, buf: str, state: dict) -
             candidates = sorted(client.waypoints.keys())
         elif cmd == "/hop" and arg_index == 1:
             candidates = sorted(load_server_directory().get("bookmarks", {}).keys())
-        elif cmd in ("/msg", "/whisper") and arg_index == 1:
-            candidates = sorted({str(p.get("nick", "")).strip() for p in client.peers.values() if str(p.get("nick", "")).strip()})
 
         matches = [head + c for c in candidates if c.lower().startswith(partial)]
 
@@ -2519,8 +2462,8 @@ def handle_command(client: MakerverseClient, text: str):
     if cmd == "/help":
         client.log("HELP", "#ff66cc", "/spawn | /setspawn [x y z] [yaw] | /clearspawn | /worldinfo [w] | /title [w] <txt|clear> | /desc [w] <txt|clear> | /tags [w] <t1,t2|clear> | /sky <hex> | /fog <hex> | /radio <url|off>")
         client.log("HELP", "#ff66cc", "/ghost [shape|off] [col] [sc] | /place <shape> [col] [sc] | /placeportal <world|srv/world> [col] [rad] | /moveobj | /scaleobj | /rotateobj | /paint | /cloneobj | /delobj | /undo | /snap [m]")
-        client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /delprefab <n> | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /diff [file.md] | /restore <file.md> | /export | /chatlog [n] | /screenshot")
-        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /cleanworld | /peers | /voice | /sfx | /clear | /mood <expr> | /nodes | /linknode <url> [lbl] | /hop <node> | /back | /nick <n>")
+        client.log("HELP", "#ff66cc", "/createworld <name> [tpl] [desc] | /templates | /saveprefab <n> [cnt] | /delprefab <n> | /prefabs | /stamp <n> [sc] | /watch <w|a> <n> <file> | /unwatch | /backup | /backups | /restore <file.md> | /export | /chatlog [n] | /screenshot")
+        client.log("HELP", "#ff66cc", "/perms | /admin <u> | /builder <u> | /setrole <u> <admin|builder|guest> | /ban <u> | /defaultrole <guest|builder> | /acl | /privateworld <on|off> | /cleanworld | /peers | /voice | /sfx | /mood <expr> | /nodes | /linknode <url> [lbl] | /hop <node> | /back | /nick <n>")
     elif cmd == "/rate":
         if len(parts) < 2 or not parts[1].strip():
             client.log("ERR", "#ff4444", "Usage: /rate <1..5> [comment] or /rate <world> <1..5> [comment]")
@@ -2840,29 +2783,20 @@ def handle_command(client: MakerverseClient, text: str):
     elif cmd == "/templates":
         t_items = [f"{k} ({v['label']})" for k, v in WORLD_TEMPLATES.items()]
         client.log("TEMPLATES", "#00ff66", "Templates: " + ", ".join(t_items))
-    elif cmd == "/createworld":
-        raw_cw = text.strip().split()
-        if len(raw_cw) < 2:
-            client.log("SYNTAX", "#ffaa00", "Usage: /createworld <name> [template] [description] — templates: " + ", ".join(WORLD_TEMPLATES.keys()))
-            return
+    elif cmd == "/createworld" and len(parts) > 1:
         try:
-            wname = _clean_ident(raw_cw[1], 32, "")
-            if not wname:
-                client.log("SYNTAX", "#ff4444", "Invalid world name. Syntax: /createworld <name> [template] [description]")
-                return
-            raw_tpl = raw_cw[2].strip() if len(raw_cw) >= 3 else "flat"
+            wname = _clean_ident(parts[1], 32, "world")
+            raw_rest = text.strip().split(" ", 2)[2].strip() if len(text.strip().split(" ", 2)) >= 3 else "flat"
+            rest_toks = raw_rest.split(" ", 1)
+            raw_tpl = rest_toks[0].strip() if rest_toks and rest_toks[0].strip() else "flat"
             tkey, matched_tpl = resolve_world_template_match(raw_tpl)
             if not matched_tpl:
-                client.log("SYNTAX", "#ffaa00", f"Unknown template '{raw_tpl}'; falling back to 'flat'. Valid templates: " + ", ".join(WORLD_TEMPLATES.keys()))
-            raw_desc = " ".join(raw_cw[3:]).strip() if len(raw_cw) >= 4 else ""
+                client.log("WARN", "#ffaa00", f"Unknown template '{raw_tpl}'; using 'flat'. Run /templates to see options.")
+            raw_desc = rest_toks[1].strip() if len(rest_toks) >= 2 else ""
             desc = raw_desc[1:-1] if len(raw_desc) >= 2 and raw_desc[0] == raw_desc[-1] and raw_desc[0] in ('"', "'") else raw_desc
             clean_send_desc = re.sub(r'[\\"\r\n\x00]', " ", " ".join(desc.split())).strip()[:200]
             md = build_template_mv3d_world(tkey, wname, clean_send_desc)
-            ok_v, err_v, _ = validate_mv3d_document(md, kind="world")
-            if not ok_v:
-                client.log("ERR", "#ff4444", f"Generated #MV3D syntax check failed: {err_v}")
-                return
-            client.log("BUILD", "#00ffcc", f"Creating world '{wname}' [template={tkey}: {WORLD_TEMPLATES[tkey]['label']}] (syntax OK)...")
+            client.log("BUILD", "#00ffcc", f"Creating world '{wname}' with template '{tkey}' ({WORLD_TEMPLATES[tkey]['label']})...")
             client.send_json({"type": "upload", "kind": "world", "name": wname, "content": md, "description": clean_send_desc})
         except Exception as exc:
             client.log("ERR", "#ff4444", f"World generation failed: {exc}")
@@ -2985,62 +2919,11 @@ def handle_command(client: MakerverseClient, text: str):
             client.ghost_active = False
             client.log("GHOST", "#ffaa00", "3D Ghost Preview OFF.")
             return
-        if tok0 == "portal":
-            if len(raw_g) < 2 or not raw_g[1].strip():
-                client.log("ERR", "#ff4444", "Usage: /ghost portal <world|server/world> [color] [radius]")
-                return
-            p_spec = raw_g[1].strip()
-            p_srv, p_w = (p_spec.split("/", 1) if "/" in p_spec and not p_spec.startswith(("ws://", "wss://")) else ("", p_spec))
-            clean_pw = _clean_ident(p_w, 32, "")
-            if not clean_pw:
-                client.log("ERR", "#ff4444", "Specify a valid target world for portal ghost preview.")
-                return
-            client.ghost_shape = "portal"
-            client.ghost_portal_dest = clean_pw
-            client.ghost_portal_server = p_srv.strip()
-            client.ghost_prefab_name = ""
-            if len(raw_g) >= 3 and raw_g[2].strip():
-                client.ghost_color = raw_g[2].strip()[:24]
-            if len(raw_g) >= 4 and raw_g[3].strip():
-                try:
-                    r_v = float(raw_g[3].strip())
-                    if math.isfinite(r_v):
-                        client.ghost_scale = max(0.25, min(7.5, round(r_v / 2.0, 2)))
-                except ValueError:
-                    pass
-            client.ghost_active = True
-            client.log("GHOST", "#00ff66", f"Portal Ghost ON -> {p_spec} ({client.ghost_color}). [LMB] Place | [Scroll] Dist | [[/]] Radius | [Esc] Off")
-            return
-        if tok0 == "prefab":
-            if len(raw_g) < 2 or not raw_g[1].strip():
-                client.log("ERR", "#ff4444", "Usage: /ghost prefab <blueprint_name> [scale]")
-                return
-            bp_nm = _clean_ident(raw_g[1].strip(), 32, "")
-            if not bp_nm:
-                client.log("ERR", "#ff4444", "Specify a valid blueprint name.")
-                return
-            client.ghost_shape = "prefab"
-            client.ghost_prefab_name = bp_nm
-            client.ghost_portal_dest = ""
-            client.ghost_portal_server = ""
-            if len(raw_g) >= 3 and raw_g[2].strip():
-                try:
-                    sc_v = float(raw_g[2].strip())
-                    if math.isfinite(sc_v):
-                        client.ghost_scale = max(0.2, min(10.0, round(sc_v, 2)))
-                except ValueError:
-                    pass
-            client.ghost_active = True
-            client.log("GHOST", "#00ff66", f"Blueprint Ghost ON: '{bp_nm}' ({client.ghost_scale:.2f}x). [LMB] Stamp | [Scroll] Dist | [[/]] Scale | [R] Rot | [Esc] Off")
-            return
         if tok0 not in ("on", "start", "1"):
             if tok0 not in PLACED_SHAPES:
-                client.log("ERR", "#ff4444", f"Unknown shape '{tok0}'. Valid: {', '.join(PLACED_SHAPES)}, portal, prefab")
+                client.log("ERR", "#ff4444", f"Unknown shape '{tok0}'. Valid: {', '.join(PLACED_SHAPES)}")
                 return
             client.ghost_shape = tok0
-            client.ghost_portal_dest = ""
-            client.ghost_portal_server = ""
-            client.ghost_prefab_name = ""
         if len(raw_g) >= 2 and raw_g[1].strip():
             client.ghost_color = raw_g[1].strip()[:24]
         if len(raw_g) >= 3 and raw_g[2].strip():
@@ -3054,8 +2937,7 @@ def handle_command(client: MakerverseClient, text: str):
         client.ghost_active = True
         client.log("GHOST", "#00ff66", f"3D Ghost Preview ON: {client.ghost_shape} ({client.ghost_color}, {client.ghost_scale:.2f}x). [LMB] Place | [Scroll] Dist | [[/]] Scale | [R] Rot | [B] Shape")
     elif cmd == "/place":
-        default_shape = client.ghost_shape if (client.ghost_active and client.ghost_shape in PLACED_SHAPES) else "box"
-        shape = parts[1].lower() if len(parts) > 1 and parts[1].strip() else default_shape
+        shape = parts[1].lower() if len(parts) > 1 and parts[1].strip() else (client.ghost_shape if client.ghost_active else "box")
         if shape not in PLACED_SHAPES:
             client.log("ERR", "#ff4444", f"Invalid shape '{shape}'. Valid: {', '.join(PLACED_SHAPES)}")
             return
@@ -3230,16 +3112,11 @@ def handle_command(client: MakerverseClient, text: str):
         client.send_json({"type": "world_backup", "action": "create", "world": client.world, "label": parts[1].strip() if len(parts) > 1 else ""})
     elif cmd == "/backups":
         client.send_json({"type": "world_backup", "action": "list", "world": client.world})
-    elif cmd == "/diff":
-        client.send_json({"type": "world_backup", "action": "diff", "world": client.world, "file": parts[1].strip() if len(parts) > 1 else ""})
     elif cmd == "/restore" and len(parts) > 1 and parts[1].strip():
         client.send_json({"type": "world_backup", "action": "restore", "world": client.world, "file": parts[1].strip()})
     elif cmd == "/export":
         client.send_json({"type": "world_backup", "action": "export", "world": client.world})
-    elif cmd == "/clear":
-        client.chat_log.clear()
-        client.log("SYSTEM", "#00ffcc", "Chat log cleared.")
-    elif cmd == "/screenshot":
+    elif cmd in ("/screenshot", "/snapimg"):
         client.screenshot_req = True
     elif cmd == "/chatlog":
         raw_n = parts[1].strip() if len(parts) > 1 and parts[1].strip() else ""
@@ -3293,7 +3170,7 @@ def handle_command(client: MakerverseClient, text: str):
     elif cmd in ("/addfriend", "/accept", "/goto") and len(parts) > 1 and parts[1].strip():
         act_m = {"/addfriend": "add", "/accept": "accept", "/goto": "goto"}[cmd]
         client.send_json({"type": "friend_action", "action": act_m, "target": parts[1].strip()})
-    elif cmd in ("/msg", "/whisper") and len(parts) >= 3:
+    elif cmd == "/msg" and len(parts) >= 3:
         msg_txt = " ".join(p for p in parts[2:] if p).strip()
         if msg_txt:
             client.send_json({"type": "friend_action", "action": "whisper", "target": parts[1].strip(), "text": msg_txt})
@@ -3808,9 +3685,6 @@ def main():
                             else:
                                 nxt_idx = (PLACED_SHAPES.index(client.ghost_shape) + 1) % len(PLACED_SHAPES) if client.ghost_shape in PLACED_SHAPES else 0
                                 client.ghost_shape = PLACED_SHAPES[nxt_idx]
-                                client.ghost_portal_dest = ""
-                                client.ghost_portal_server = ""
-                                client.ghost_prefab_name = ""
                         elif event.key == K_x and client.ghost_active:
                             client.ghost_active = False
                             client.log("GHOST", "#ffaa00", "3D Ghost Preview OFF.")
@@ -3935,9 +3809,6 @@ def main():
                     if keys[K_LSHIFT]: cam_pos[1] -= speed
                 else:
                     client.vel_y = step_player_physics(cam_pos, move_dx, move_dz, client.vel_y, bool(keys[K_SPACE]), dt, client.spatial_hash)
-                    if (move_dx != 0.0 or move_dz != 0.0) and abs(client.vel_y) < 0.05 and (now - client.last_step_sfx_at) >= 0.42:
-                        client.last_step_sfx_at = now
-                        client.sfx.play("step_tick")
 
                 client.check_portals_and_triggers(cam_pos, now)
             client.poll_file_watch(now)
@@ -4213,8 +4084,7 @@ def main():
                         border_px=1.0,
                         corner_len=10.0,
                     )
-                    g_target_lbl = f"PORTAL -> {client.ghost_portal_dest}" if client.ghost_shape == "portal" else (f"PREFAB: {client.ghost_prefab_name}" if client.ghost_shape == "prefab" else client.ghost_shape.upper())
-                    g_l1 = _fit_hud_text(font, f"GHOST [B]: {g_target_lbl} | {client.ghost_color} | {client.ghost_scale:.2f}x | {client.ghost_dist:.1f}m", g_iw - 20)
+                    g_l1 = _fit_hud_text(font, f"GHOST [B]: {client.ghost_shape.upper()} | {client.ghost_color} | {client.ghost_scale:.2f}x | {client.ghost_dist:.1f}m", g_iw - 20)
                     g_l2 = _fit_hud_text(font, f"XYZ ({gx_h:.1f}, {gy_h:.1f}, {gz_h:.1f}) yaw {gyaw_h:.0f} deg - [LMB] Place | [Esc] Cancel", g_iw - 20)
                     renderer.draw_text_2d(font, g_ix + 10, g_iy + 8, g_l1, (0, 255, 215))
                     renderer.draw_text_2d(font, g_ix + 10, g_iy + 32, g_l2, (175, 245, 220))

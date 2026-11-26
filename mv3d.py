@@ -66,9 +66,6 @@ WORLD_TEMPLATES = {
     "fortress": {"label": "Obsidian Citadel", "desc": "Walled stone keep with four corner watchtowers"},
     "island": {"label": "Tropical Atoll", "desc": "Sandy palm islands rising out of a turquoise sea"},
     "space": {"label": "Orbital Station Deck", "desc": "Deep-space platform ringed by glowing beacons"},
-    "arena": {"label": "Neon Laser Arena", "desc": "Symmetrical tactical cover pillars, ramps, and central dais"},
-    "skyislands": {"label": "Floating Sky Islands", "desc": "Suspended sky platforms linked by glowing light-bridges"},
-    "gallery": {"label": "Hologram Exhibition Hall", "desc": "Multi-wing showcase pavilion with display pedestals"},
 }
 
 
@@ -1476,9 +1473,6 @@ TEMPLATE_ALIASES = {
     "fortress": "fortress", "citadel": "fortress", "castle": "fortress",
     "island": "island", "atoll": "island", "tropical": "island",
     "space": "space", "station": "space", "orbit": "space",
-    "arena": "arena", "laserarena": "arena", "maze": "arena",
-    "skyislands": "skyislands", "sky": "skyislands", "floating": "skyislands",
-    "gallery": "gallery", "museum": "gallery", "hall": "gallery", "showcase": "gallery",
 }
 
 
@@ -1518,9 +1512,6 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
         "fortress": ('["#1f1a33", "#473357"]', "#3d3d47", "#d9ad38", "#bf3340"),
         "island": ('["#0d4785", "#4da6d9"]', "#0a5294", "#ebc76b", "#26d9bf"),
         "space": ('["#03030d", "#170533"]', "#2e3347", "#1af2cc", "#ff850d"),
-        "arena": ('["#070414", "#1d0936"]', "#0d1222", "#00ffd9", "#ff2a9d"),
-        "skyislands": ('["#0b2545", "#3b82c4"]', "#09182e", "#38f2d2", "#ffb703"),
-        "gallery": ('["#080c18", "#16213e"]', "#111827", "#00f5d4", "#ff66cc"),
     }
     sky, ground_c, acc1, acc2 = themes[tkey]
     tags_val = f"[{tkey}, arctic, makerverse]" if tkey == "crystal" else f"[{tkey}, makerverse]"
@@ -1566,48 +1557,6 @@ def build_template_mv3d_world(template_key: str, world_name: str, custom_desc: s
             lines.append(f" ## Part: CavernCluster_{c_i}")
             lines.append(f" * **pos**: [{cx}, {ch * 0.5:.2f}, {cz}]")
             lines.append(f' * **cone**: {{ radius: {round(ch * 0.32, 2)}, height: {ch}, color: "{c_col}", glow: "{c_col}" }}')
-    elif tkey == "arena":
-        for p_i, (ax, az, aw, ah, ad, acol) in enumerate((
-            (0.0, 0.0, 6.0, 0.6, 6.0, acc1),
-            (-9.0, -9.0, 3.0, 3.2, 3.0, acc2),
-            (9.0, -9.0, 3.0, 3.2, 3.0, acc2),
-            (-9.0, 9.0, 3.0, 3.2, 3.0, acc2),
-            (9.0, 9.0, 3.0, 3.2, 3.0, acc2),
-            (-16.0, 0.0, 1.2, 4.0, 18.0, acc1),
-            (16.0, 0.0, 1.2, 4.0, 18.0, acc1),
-            (0.0, -16.0, 18.0, 4.0, 1.2, acc1),
-        )):
-            lines.append(f" ## Part: ArenaBlock_{p_i}")
-            lines.append(f" * **pos**: [{ax}, {ah * 0.5:.2f}, {az}]")
-            lines.append(f' * **box**: {{ size: [{aw}, {ah}, {ad}], color: "{acol}", glow: "#091526" }}')
-    elif tkey == "skyislands":
-        islands = (
-            (0.0, 1.2, 10.0, 9.0, 9.0, acc1),
-            (-14.0, 2.2, 0.0, 7.5, 7.5, acc2),
-            (14.0, 2.2, 0.0, 7.5, 7.5, acc2),
-            (0.0, 3.2, -14.0, 8.5, 8.5, acc1),
-        )
-        for isl_i, (ix, iy, iz, iw, idp, icol) in enumerate(islands):
-            lines.append(f" ## Part: SkyIsland_{isl_i}")
-            lines.append(f" * **pos**: [{ix}, {iy}, {iz}]")
-            lines.append(f' * **box**: {{ size: [{iw}, 0.9, {idp}], color: "{icol}", glow: "#0a2239" }}')
-        for br_i, (bx, by, bz, bw, bdp) in enumerate((
-            (-7.0, 1.8, 5.0, 6.5, 2.2),
-            (7.0, 1.8, 5.0, 6.5, 2.2),
-            (0.0, 2.4, -2.0, 2.4, 14.0),
-        )):
-            lines.append(f" ## Part: LightBridge_{br_i}")
-            lines.append(f" * **pos**: [{bx}, {by}, {bz}]")
-            lines.append(f' * **box**: {{ size: [{bw}, 0.16, {bdp}], color: "{acc1}", glow: "{acc1}" }}')
-    elif tkey == "gallery":
-        for ped_i, (px_g, pz_g) in enumerate(((-8.0, 4.0), (8.0, 4.0), (-8.0, -4.0), (8.0, -4.0), (0.0, -10.0))):
-            pcol = acc1 if ped_i % 2 == 0 else acc2
-            lines.append(f" ## Part: Pedestal_{ped_i}")
-            lines.append(f" * **pos**: [{px_g}, 0.65, {pz_g}]")
-            lines.append(f' * **cylinder**: {{ radius: 1.15, height: 1.3, color: "{pcol}", glow: "#0b1a2e" }}')
-            lines.append(f" ## Part: PedestalHalo_{ped_i}")
-            lines.append(f" * **pos**: [{px_g}, 2.35, {pz_g}]")
-            lines.append(f' * **sphere**: {{ radius: 0.42, color: "{pcol}", glow: "{pcol}" }}')
     else:
         for idx in range(14):
             ang = (2.0 * math.pi * idx) / 14.0
@@ -1758,7 +1707,7 @@ def build_ghost_preview_objects(
     alpha: float = 0.42,
 ) -> list[dict]:
     sh = str(shape or "box").strip().lower()
-    if sh not in PLACED_SHAPES and sh != "portal":
+    if sh not in PLACED_SHAPES:
         sh = "box"
     s = max(0.2, min(20.0, _finite_float(scale, 1.0, 0.2, 20.0)))
     px = _finite_float(x, 0.0, -500.0, 500.0)
@@ -1793,12 +1742,6 @@ def build_ghost_preview_objects(
         return [{"kind": "box", "pos": (px, py + 0.15 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "size": (4.0 * s, 0.3 * s, 4.0 * s), "diff": diff, "emis": emis, "alpha": a_val}]
     if sh == "wall":
         return [{"kind": "box", "pos": (px, py + 1.5 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "size": (4.5 * s, 3.0 * s, 0.4 * s), "diff": diff, "emis": emis, "alpha": a_val}]
-    if sh == "portal":
-        rad = max(0.5, min(15.0, 2.0 * s))
-        return [
-            {"kind": "cylinder", "pos": (px, py + 1.2, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "radius": min(1.5, rad * 0.45), "height": 2.4, "diff": diff, "emis": (diff[0] * 0.7, diff[1] * 0.7, diff[2] * 0.7), "alpha": a_val},
-            {"kind": "cylinder", "pos": (px, py + 0.04, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "radius": rad, "height": 0.08, "diff": diff, "emis": emis, "alpha": min(0.85, a_val * 0.65)},
-        ]
     return [{"kind": "box", "pos": (px, py + 1.0 * s, pz), "rot": (0.0, 1.0, 0.0, yaw), "scale": (1.0, 1.0, 1.0), "size": (2.0 * s, 2.0 * s, 2.0 * s), "diff": diff, "emis": emis, "alpha": a_val}]
 
 

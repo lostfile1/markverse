@@ -2367,27 +2367,6 @@ async def handler(websocket):
                         pkt_rest = _build_world_data_packet(target, restored_md, meta.get(target, {}), in_place=True)
                     await broadcast_world(target, pkt_rest)
                     await websocket.send(json.dumps({"type": "info", "msg": f"Restored '{target}' from {raw_file}."}))
-                elif action == "diff":
-                    snaps = list_world_snapshots(target)
-                    raw_file = str(data.get("file", "")).strip() or (snaps[0]["file"] if snaps else "")
-                    if not raw_file or not re.fullmatch(r"[A-Za-z0-9_-]+\.md", raw_file):
-                        await websocket.send(json.dumps({"type": "error", "msg": "No backup snapshot available to diff."}))
-                        continue
-                    snap_path = _safe_child_path(BACKUPS_DIR / target, raw_file)
-                    if snap_path is None or not snap_path.exists():
-                        await websocket.send(json.dumps({"type": "error", "msg": "Backup snapshot not found."}))
-                        continue
-                    cur_lines = read_md_safe(md_path).splitlines()
-                    old_lines = read_md_safe(snap_path).splitlines()
-                    cur_set, old_set = set(cur_lines), set(old_lines)
-                    added = sum(1 for ln in cur_lines if ln not in old_set and ln.strip())
-                    removed = sum(1 for ln in old_lines if ln not in cur_set and ln.strip())
-                    cur_objs = len(parse_mv3d("\n".join(cur_lines)).get("objects", []))
-                    old_objs = len(parse_mv3d("\n".join(old_lines)).get("objects", []))
-                    await websocket.send(json.dumps({
-                        "type": "info",
-                        "msg": f"Diff vs {raw_file}: +{added} / -{removed} lines ({old_objs} -> {cur_objs} objects).",
-                    }))
                 elif action == "export":
                     await websocket.send(json.dumps({"type": "world_export_data", "world": target, "md": read_md_safe(md_path), "meta": w_entry, "save_path": str(data.get("save_path", ""))}))
 
@@ -2616,10 +2595,7 @@ async def handler(websocket):
                         fdata["friends"][t_key] = [k for k in fdata["friends"][t_key] if k != my_key]
                         save_friends(fdata)
                         await websocket.send(json.dumps({"type": "info", "msg": f"Removed {t_nick} from friends."}))
-                    elif action == "whisper":
-                        if t_key not in online_by_key:
-                            await websocket.send(json.dumps({"type": "error", "msg": f"{t_nick} is not currently online."}))
-                            continue
+                    elif action == "whisper" and t_key in fdata["friends"][my_key] and t_key in online_by_key:
                         pm_text = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("text", "")))[:300].strip()
                         if pm_text:
                             _, t_st_w = online_by_key[t_key]
